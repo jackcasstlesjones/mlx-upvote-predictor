@@ -1,0 +1,20 @@
+# Word2Vec Training Configuration
+
+# Model parameters
+embed_dim: 100
+window_size: 5
+min_count: 5
+neg_samples: 10
+
+# Training parameters
+learning_rate: 0.002
+batch_size: 512
+epochs: 5
+
+# Paths
+checkpoint_dir: "checkpoints"
+embeddings_dir: "embeddings"
+vocab_path: "data/processed/vocab.pkl"
+
+# Random seed for reproducibility
+seed: 42
