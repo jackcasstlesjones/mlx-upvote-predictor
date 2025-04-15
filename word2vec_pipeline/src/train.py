@@ -124,7 +124,7 @@ def train_model(
     dataloader = create_dataloader(
         dataset,
         batch_size=batch_size,
-        num_workers=4
+        num_workers=0  # Use 0 to avoid multiprocessing issues with generators
     )
     
     # Training loop

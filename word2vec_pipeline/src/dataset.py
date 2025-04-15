@@ -1,7 +1,7 @@
 import random
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 
 def generate_skipgram_pairs(tokens, vocab, window_size=5):
     """
@@ -29,7 +29,7 @@ def generate_skipgram_pairs(tokens, vocab, window_size=5):
                 context = token_ids[j]
                 yield (center, context)
 
-class SkipgramDataset(Dataset):
+class SkipgramDataset(IterableDataset):
     def __init__(self, token_stream, vocab, window_size=5, neg_samples=5):
         """
         Dataset for Skip-gram model training
@@ -120,9 +120,11 @@ def create_dataloader(dataset, batch_size=512, num_workers=4):
             torch.LongTensor(negatives)
         )
     
+    # We need to use IterableDataset approach
     return DataLoader(
         dataset,
         batch_size=batch_size,
         collate_fn=collate_fn,
-        num_workers=num_workers
+        num_workers=num_workers,
+        shuffle=False,  # Cannot shuffle an IterableDataset
     )
