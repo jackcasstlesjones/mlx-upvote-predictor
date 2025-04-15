@@ -1,6 +1,6 @@
 # To create the conda environment, run:
 #   conda env create -f environment.yml
-name: upvote-predictor
+name: mlx-upvote-predictor
 channels:
   - defaults
   - pytorch
