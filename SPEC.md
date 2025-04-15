@@ -35,11 +35,11 @@ The Hacker News Upvote Predictor is a machine learning system designed to predic
 
 ### 1.4 References
 
-- Project Brief (BRIEF.md)
-- Data Analysis Report (REPORT.md)
+- [Project Brief](BRIEF.md)
+- [Data Analysis Report](REPORT.md)
 - [Hacker News Website](https://news.ycombinator.com/)
 - [Word2Vec Paper](https://arxiv.org/pdf/1301.3781.pdf)
-- [Text8 Dataset](https://huggingface.co/datasets/ardMLX/text8)
+- [Text8 Dataset](https://huggingface.co/datasets/afmck/text8)
 
 ### 1.5 Document Overview
 
@@ -89,7 +89,7 @@ The system will be used exclusively by the development team, consisting of membe
 Must-have features:
 
 - Title processing and word embedding using Word2Vec
-- Domain-based features (domain reputation score)
+- Domain-based features (domain reputation)
 - Content-based features (title length, title content)
 - Timing-based features (day of week, hour of posting)
 - API endpoints as specified in the brief
@@ -139,7 +139,7 @@ The system will interact with:
 - The system shall connect to the PostgreSQL database using the connection string provided
 - The system shall extract and process the following features:
   - Title text (for Word2Vec processing)
-  - Domain (extracted from URL without extension)
+  - Domain (extracted from URL without extension, with a special "no_domain" token for posts without URLs)
   - Time of day (extracted from timestamp)
   - Day of week (extracted from timestamp)
   - Title length (character count)
@@ -152,10 +152,15 @@ The system will interact with:
 
 #### 3.2.3 Prediction Model
 
-- The system shall implement a neural network model to predict upvote scores
+- The system shall implement a feed-forward neural network model to predict upvote scores
+- The network architecture shall consist of:
+  - An embedding layer for domains (allowing the model to learn domain importance)
+  - An input layer accepting concatenated features (word embeddings, domain embeddings, timing features, etc.)
+  - 2-3 hidden layers with ReLU activations
+  - A single output neuron with linear activation for the regression task
 - The model shall use the following inputs:
   - Averaged word embeddings from the title
-  - Domain reputation score
+  - Domain (using a dedicated embedding layer, including handling for posts with no domain)
   - Time of day
   - Day of week
   - Title length
