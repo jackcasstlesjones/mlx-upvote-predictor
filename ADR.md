@@ -3,15 +3,15 @@
 ## For Hacker News Upvote Predictor
 
 Version 0.1  
-Prepared by System Architect  
+Prepared by maxitect 
 MLX Institute  
 15 April 2025
 
 ## Revision History
 
-| Name             | Date       | Reason For Changes            | Version |
-| ---------------- | ---------- | ----------------------------- | ------- |
-| System Architect | 15/04/2025 | Initial architecture document | 0.1     |
+| Name     | Date       | Reason For Changes            | Version |
+| -------- | ---------- | ----------------------------- | ------- |
+| maxitect | 15/04/2025 | Initial architecture document | 0.1     |
 
 ## 1. Context and Problem Statement
 

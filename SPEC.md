@@ -3,14 +3,14 @@
 ## For Hacker News Upvote Predictor
 
 Version 0.1  
-Prepared by Project Team  
+Prepared by maxitect  
 15 April 2025
 
 ## Revision History
 
-| Name         | Date       | Reason For Changes    | Version |
-| ------------ | ---------- | --------------------- | ------- |
-| Project Team | 15/04/2025 | Initial specification | 0.1     |
+| Name     | Date       | Reason For Changes    | Version |
+| -------- | ---------- | --------------------- | ------- |
+| maxitect | 15/04/2025 | Initial specification | 0.1     |
 
 ## 1. Introduction
 
