@@ -56,7 +56,7 @@ def train_epoch(model, dataloader, optimizer, device):
             elapsed = timer.elapsed()
             print(f"Batch {i+1}, Loss: {loss.item():.4f}, "
                   f"Speed: {100 / elapsed:.1f} batches/s")
-            timer.start(s it )
+            timer.start()
     
     # Return average loss
     return total_loss / total_batches
@@ -116,25 +116,25 @@ def train_model(
         print(f"Resuming from checkpoint: {resume_from}")
         model, optimizer, start_epoch, _ = load_checkpoint(model, optimizer, resume_from)
     
-    # Create dataset and dataloader
-    dataset = SkipgramDataset(
-        token_stream_fn(),
-        vocab,
-        window_size=window_size,
-        neg_samples=neg_samples
-    )
-    
-    dataloader = create_dataloader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=0  # Use 0 to avoid multiprocessing issues with generators
-    )
-    
     # Training loop
     print(f"Starting training for {epochs} epochs")
     best_loss = float('inf')
     
     for epoch in range(start_epoch, epochs):
+        # Create a new dataset and dataloader for each epoch
+        dataset = SkipgramDataset(
+            token_stream_fn(),
+            vocab,
+            window_size=window_size,
+            neg_samples=neg_samples
+        )
+        
+        dataloader = create_dataloader(
+            dataset,
+            batch_size=batch_size,
+            num_workers=0  # Use 0 to avoid multiprocessing issues with generators
+        )
+        
         # Train for one epoch
         print(f"Epoch {epoch+1}/{epochs}")
         epoch_timer = Timer()
