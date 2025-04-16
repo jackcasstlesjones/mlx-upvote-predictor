@@ -79,5 +79,6 @@ temp/
 .github/workflows/.env
 
 # Miscellaneous
+claude-conversations/
 .history/
 .aider*

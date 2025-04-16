@@ -1,12 +1,15 @@
 import os
+
+import numpy as np
 import torch
 import torch.optim as optim
-import numpy as np
 from torch.utils.data import DataLoader
 
-from .model import SkipGramModel
 from .dataset import SkipgramDataset, create_dataloader
-from .utils import Timer, save_checkpoint, save_embeddings, get_device, set_seed
+from .model import SkipGramModel
+from .utils import (Timer, get_device, save_checkpoint, save_embeddings,
+                    set_seed)
+
 
 def train_epoch(model, dataloader, optimizer, device):
     """
@@ -53,7 +56,7 @@ def train_epoch(model, dataloader, optimizer, device):
             elapsed = timer.elapsed()
             print(f"Batch {i+1}, Loss: {loss.item():.4f}, "
                   f"Speed: {100 / elapsed:.1f} batches/s")
-            timer.start()
+            timer.start(s it )
     
     # Return average loss
     return total_loss / total_batches
