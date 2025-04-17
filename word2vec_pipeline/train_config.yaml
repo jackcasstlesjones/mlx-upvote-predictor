@@ -18,4 +18,3 @@ vocab_path: "data/processed/vocab.pkl"
 
 # Random seed for reproducibility
 seed: 42
-
