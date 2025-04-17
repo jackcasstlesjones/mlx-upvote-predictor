@@ -4,7 +4,7 @@ This repository implements a machine learning system to predict upvotes for Hack
 
 ---
 
-## Project Overview
+## Project Summary
 
 • Word2Vec Pipeline
 
