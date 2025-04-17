@@ -1,8 +1,8 @@
 """
 Tokenization utilities for Word2Vec model.
 
-This module provides functions to convert text into tokens suitable for 
-Word2Vec training, including specialized handling for various text formats 
+This module provides functions to convert text into tokens suitable for
+Word2Vec training, including specialized handling for various text formats
 and technical terminology common in Hacker News discussions.
 """
 
@@ -44,8 +44,7 @@ def tokenize(text: str, domain_specific: bool = False) -> List[str]:
         # First, handle known technical patterns
         text = re.sub(r'(https?://\S+)', ' <URL> ', text)  # Replace URLs
         # Preserve ticker symbols
-        text = re.sub(r'(\$[A-Z]+)', ' \g<1> ', text)
-
+        text = re.sub(r'(\$[A-Z]+)', r' \g<1> ', text)
         # Split on whitespace and punctuation, preserving some
         # technical patterns
         raw_tokens = re.findall(r'[a-zA-Z0-9_]+|[^\w\s]', text.lower())
