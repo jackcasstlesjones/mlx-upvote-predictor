@@ -9,6 +9,7 @@ This module provides helper functions for:
 - Model export utilities
 """
 
+import logging
 import os
 import json
 import numpy as np
@@ -203,6 +204,64 @@ def export_model(model: torch.nn.Module,
         "vocabulary": vocab_path,
         "metadata": meta_path
     }
+
+
+def export_model_to_wandb(export_paths, config, version, eval_results=None):
+    """
+    Upload exported model to Weights & Biases as an artifact.
+
+    Args:
+        export_paths: Dictionary of paths to exported files
+        config: Model configuration
+        version: Model version string
+        eval_results: Evaluation results (optional)
+    """
+    try:
+        import wandb
+    except ImportError:
+        logging.warning(
+            "wandb not installed, skipping upload to Weights & Biases")
+        return
+
+    # Initialize wandb if not already initialized
+    if wandb.run is None:
+        wandb.init(
+            project="word2vec-embeddings",
+            name=f"word2vec-v{version}",
+            config=config
+        )
+
+    # Create a new artifact
+    artifact = wandb.Artifact(
+        name=f"word2vec-model-v{version}",
+        type="model",
+        description="Word2Vec model trained on text8 dataset"
+    )
+
+    # Add files to the artifact
+    for key, path in export_paths.items():
+        artifact.add_file(path, name=key)
+
+    # Log evaluation metrics if available
+    if eval_results:
+        wandb.log({
+            "standard_score":
+            eval_results["overall_scores"]["standard_score"],
+            "tech_domain_score":
+            eval_results["overall_scores"]["tech_domain_score"],
+            "combined_score":
+            eval_results["overall_scores"]["combined_score"],
+            "word_similarity":
+            eval_results["standard_evaluation"]
+            ["word_similarity"]
+            ["average_similarity"],
+            "analogy_accuracy":
+            eval_results["standard_evaluation"]["analogies"]["accuracy"]
+        })
+
+    # Log the artifact
+    wandb.log_artifact(artifact)
+    logging.info("Model uploaded to Weights & Biases")
 
 
 class Timer:
