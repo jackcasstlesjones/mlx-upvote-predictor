@@ -27,23 +27,29 @@ This repository implements a machine learning system to predict upvotes for Hack
 
 ## Directory Structure
 
-Word2vec Pipeline:  
- word2vec_pipeline/  
- ├── src/ (Python modules for tokenization, vocabulary, dataset, training, and model)  
- ├── test_word_similarity.py  
- ├── train_config.yaml  
- └── train_text8.py
+Word2vec Pipeline:
 
-Project Root:  
- ├── .gitignore  
- ├── ADR.md  
- ├── environment.yml  
- ├── jacks_plan.md  
- ├── README.md  
- ├── REPORT.md  
- ├── requirements.txt  
- ├── SPEC.md  
- └── STANDARDS.md
+```
+  word2vec_pipeline/
+    ├── src/ (Python modules for tokenization, vocabulary, dataset, training, and model)
+    ├── test_word_similarity.py
+    ├── train_config.yaml
+    └── train_text8.py
+```
+
+Project Root:
+
+```
+  ├── .gitignore
+  ├── ADR.md
+  ├── environment.yml
+  ├── jacks_plan.md
+  ├── README.md
+  ├── REPORT.md
+  ├── requirements.txt
+  ├── SPEC.md
+  └── STANDARDS.md
+```
 
 ---
 
