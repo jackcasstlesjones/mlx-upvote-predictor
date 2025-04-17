@@ -9,11 +9,12 @@ neg_samples: 10
 # Training parameters
 learning_rate: 0.002
 batch_size: 512
-epochs: 5
+epochs: 20
 
 # Paths
 checkpoint_dir: "checkpoints"
 embeddings_dir: "embeddings"
+export_dir: "exported_model"
 vocab_path: "data/processed/vocab.pkl"
 
 # Random seed for reproducibility
