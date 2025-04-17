@@ -32,7 +32,8 @@ class Vocabulary:
         filtered_words = [word for word,
                           count in counter.items() if count >= self.min_freq]
         print(
-            f"Keeping {len(filtered_words)} tokens with min frequency {self.min_freq}")
+            f"Keeping {len(filtered_words)} tokens with "
+            f"min frequency {self.min_freq}")
 
         # Add <UNK> token at index 0
         self.word2idx = {"<UNK>": 0}
@@ -45,7 +46,11 @@ class Vocabulary:
 
         # Store frequencies including <UNK>
         self.frequencies = {
-            0: sum(count for word, count in counter.items() if count < self.min_freq)}
+            0: sum(
+                count for word,
+                count in counter.items() if count < self.min_freq
+            )
+        }
         for word, idx in self.word2idx.items():
             if word != "<UNK>":
                 self.frequencies[idx] = counter[word]
@@ -95,7 +100,10 @@ class Vocabulary:
         if not self.sampling_table:
             return token_ids
 
-        return [idx for idx in token_ids if np.random.random() > self.sampling_table.get(idx, 0)]
+        return [
+            idx for idx in token_ids
+            if np.random.random() > self.sampling_table.get(idx, 0)
+        ]
 
     def __len__(self):
         """Return vocabulary size"""
