@@ -25,7 +25,7 @@ from src.data_loader import prepare_text8_data, get_token_stream
 from src.vocab import Vocabulary
 from src.train import train_model
 from src.utils import Timer, set_seed, export_model as utils_export_model
-from src.eval_utils import evaluate_embeddings
+from src.evaluation import evaluate_embeddings
 
 
 def setup_logging() -> None:
@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=str,
-        default="train_config.yaml",
+        default="config.yaml",
         help="Path to configuration file"
     )
 
