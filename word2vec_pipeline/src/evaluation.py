@@ -16,6 +16,7 @@ from typing import Dict, List, Tuple, Any, Optional
 
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
+from src.utils import convert_numpy_types
 
 
 class Word2VecEvaluator:
@@ -628,6 +629,13 @@ def evaluate_embeddings(
 
     # Run evaluation
     results = evaluator.run_comprehensive_evaluation()
+
+    # In the evaluate_embeddings function, before saving results:
+    results = convert_numpy_types(results)
+
+    # Then save as before
+    with open(output_path, 'w') as f:
+        json.dump(results, f, indent=2)
 
     # Save results if output path is provided
     if output_path:
