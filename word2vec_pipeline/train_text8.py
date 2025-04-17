@@ -9,7 +9,7 @@ import yaml
 import pickle
 from datasets import load_dataset
 
-from src.tokenize import load_and_tokenize_text8, stream_tokens
+from src.tokenize import load_and_tokenize_text8
 from src.vocab import Vocabulary
 from src.train import train_model
 
@@ -155,4 +155,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -3,7 +3,6 @@
 Test word embeddings for semantic similarity
 """
 
-from src.vocab import Vocabulary
 import os
 import pickle
 import sys
