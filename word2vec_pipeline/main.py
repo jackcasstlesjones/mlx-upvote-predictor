@@ -24,7 +24,7 @@ import torch
 from src.data_loader import prepare_text8_data, get_token_stream
 from src.vocab import Vocabulary
 from src.train import train_model
-from src.utils import Timer, set_seed, export_model as utils_export_model
+from src.utils import Timer, set_seed, export_model, export_model_to_wandb
 from src.evaluation import evaluate_embeddings
 
 
@@ -343,7 +343,7 @@ def main() -> None:
                 sys.exit(1)
 
         # Export model
-        export_paths = utils_export_model(
+        export_paths = export_model(
             model,
             vocab,
             config,
@@ -359,6 +359,11 @@ def main() -> None:
 
             export_paths["evaluation"] = eval_path
             logging.info(f"Saved evaluation results to {eval_path}")
+
+        if config.get("upload_to_wandb", False):
+            export_model_to_wandb(
+                export_paths, config, args.version, eval_results
+            )
 
         export_time = export_timer.elapsed()
         logging.info(f"Export completed in {export_time:.2f}s")
