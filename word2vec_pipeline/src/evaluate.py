@@ -7,7 +7,7 @@ and domain-specific benchmarks, generating a comprehensive report
 that can be used to assess model quality before export.
 """
 
-from src.evaluation import evaluate_embeddings
+from evaluation import evaluate_embeddings
 import os
 import sys
 import argparse
