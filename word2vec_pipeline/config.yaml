@@ -16,6 +16,7 @@ checkpoint_dir: "checkpoints"
 embeddings_dir: "embeddings"
 export_dir: "exported_model"
 vocab_path: "data/processed/vocab.pkl"
+upload_to_wandb: true
 
 # Random seed for reproducibility
 seed: 42
