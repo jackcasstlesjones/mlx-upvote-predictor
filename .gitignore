@@ -82,3 +82,4 @@ temp/
 claude-conversations/
 .history/
 .aider*
+wandb/
