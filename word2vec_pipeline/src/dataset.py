@@ -1,7 +1,7 @@
 import random
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, IterableDataset
+from torch.utils.data import DataLoader, IterableDataset
 
 
 def generate_skipgram_pairs(tokens, vocab, window_size=5):
@@ -25,7 +25,10 @@ def generate_skipgram_pairs(tokens, vocab, window_size=5):
         window = random.randint(1, window_size)
 
         # Generate pairs for all context words within window
-        for j in range(max(0, i - window), min(len(token_ids), i + window + 1)):
+        for j in range(
+            max(0, i - window),
+            min(len(token_ids), i + window + 1)
+        ):
             if i != j:  # Skip the center word itself
                 context = token_ids[j]
                 yield (center, context)
@@ -53,7 +56,8 @@ class SkipgramDataset(IterableDataset):
 
     def _create_negative_sampling_table(self, table_size=100000000):
         """
-        Create table for negative sampling, using unigram distribution raised to power of 0.75
+        Create table for negative sampling, using unigram
+        distribution raised to power of 0.75
         """
         vocab_size = len(self.vocab)
         sampling_weights = np.zeros(vocab_size)
@@ -76,7 +80,8 @@ class SkipgramDataset(IterableDataset):
 
     def _get_negative_samples(self, positive_idx, n_samples):
         """
-        Get negative samples from precomputed table, avoiding the positive sample
+        Get negative samples from precomputed table,
+        avoiding the positive sample
         """
         indices = np.random.randint(
             0, len(self.neg_sampling_table), size=n_samples + 10)
@@ -95,10 +100,15 @@ class SkipgramDataset(IterableDataset):
 
     def __iter__(self):
         """
-        Iterate through token stream and yield batches of (center, context, negatives)
+        Iterate through token stream and yield
+        batches of (center, context, negatives)
         """
         for tokens in self.token_stream:
-            for center, context in generate_skipgram_pairs(tokens, self.vocab, self.window_size):
+            for center, context in generate_skipgram_pairs(
+                tokens,
+                self.vocab,
+                self.window_size
+            ):
                 neg_samples = self._get_negative_samples(
                     context, self.neg_samples)
                 yield center, context, neg_samples
@@ -134,4 +144,3 @@ def create_dataloader(dataset, batch_size=512, num_workers=4):
         num_workers=num_workers,
         shuffle=False,  # Cannot shuffle an IterableDataset
     )
-

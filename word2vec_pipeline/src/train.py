@@ -1,14 +1,17 @@
 import os
 
-import numpy as np
-import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader
 
 from .dataset import SkipgramDataset, create_dataloader
 from .model import SkipGramModel
-from .utils import (Timer, get_device, save_checkpoint, save_embeddings,
-                    set_seed)
+from .utils import (
+    Timer,
+    get_device,
+    load_checkpoint,
+    save_checkpoint,
+    save_embeddings,
+    set_seed
+)
 
 
 def train_epoch(model, dataloader, optimizer, device):
@@ -134,7 +137,8 @@ def train_model(
         dataloader = create_dataloader(
             dataset,
             batch_size=batch_size,
-            num_workers=0  # Use 0 to avoid multiprocessing issues with generators
+            num_workers=0
+            # Use 0 to avoid multiprocessing issues with generators
         )
 
         # Train for one epoch
@@ -147,7 +151,9 @@ def train_model(
         # Report progress
         elapsed = epoch_timer.elapsed()
         print(
-            f"Epoch {epoch+1} completed in {elapsed:.2f}s, Loss: {epoch_loss:.4f}")
+            f"Epoch {epoch+1} completed in {elapsed:.2f}s, "
+            f"Loss: {epoch_loss:.4f}"
+        )
 
         # Save checkpoint
         checkpoint_path = os.path.join(
