@@ -1,0 +1,3811 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+<additional_info>
+
+</additional_info>
+
+</file_summary>
+
+<directory_structure>
+word2vec_pipeline/
+  src/
+    __init__.py
+    dataset.py
+    model.py
+    tokenize.py
+    train.py
+    utils.py
+    vocab.py
+  test_word_similarity.py
+  train_config.yaml
+  train_text8.py
+.gitignore
+ADR.md
+environment.yml
+jacks_plan.md
+PLAN.md
+README.md
+REPORT.md
+requirements.txt
+SPEC.md
+STANDARDS.md
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="jacks_plan.md">
+# 🔧 End-to-End Manual Word2Vec (Skip-gram) with PyTorch
+
+## Overview
+
+This plan guides you through:
+
+- Pretraining a **Skip-gram Word2Vec** model from scratch on a **54.4MB Wikipedia corpus**
+- Fine-tuning it on **28GB of Hacker News titles**
+- All using **only PyTorch, NumPy, and Python stdlib**
+- Modular, GPU-compatible, reproducible
+
+Intrinsic evaluation is skipped — embeddings will be evaluated downstream in your regression model.
+
+---
+
+## 🧱 Project Structure
+
+```
+word2vec_pipeline/
+├── data/
+│   ├── raw/
+│   │   ├── wikipedia.txt
+│   │   └── hn_titles.txt
+│   └── processed/
+│       ├── wiki_tokens.txt
+│       └── hn_tokens.txt
+├── src/
+│   ├── tokenize.py
+│   ├── vocab.py
+│   ├── dataset.py
+│   ├── model.py
+│   ├── train.py
+│   ├── fine_tune.py
+│   └── utils.py
+├── checkpoints/
+│   ├── pretrain_epoch_*.pt
+│   └── finetune_epoch_*.pt
+├── embeddings/
+│   └── word_vectors.npy
+└── train_config.yaml
+```
+
+---
+
+## 1. 📥 Load and Preprocess Corpus
+
+**Input**: `wikipedia.txt`, `hn_titles.txt`
+
+### Tokenization (src/tokenize.py)
+
+```python
+import re
+
+def tokenize(text):
+    text = text.lower()
+    text = re.sub(r'[^a-z\s]', '', text)
+    return text.strip().split()
+```
+
+### Disk streaming for large corpora
+
+Use `yield` and `readline()` to tokenize line-by-line, keeping memory low:
+
+```python
+def stream_tokens(path):
+    with open(path, 'r') as f:
+        for line in f:
+            yield tokenize(line)
+```
+
+---
+
+## 2. 🧠 Build Vocabulary (src/vocab.py)
+
+```python
+from collections import Counter
+
+def build_vocab(token_stream, min_freq=5):
+    counter = Counter()
+    for tokens in token_stream:
+        counter.update(tokens)
+
+    vocab = {word: i+1 for i, (word, freq) in enumerate(counter.items()) if freq >= min_freq}
+    vocab["<UNK>"] = 0
+    return vocab
+```
+
+Include:
+
+- Word → ID map
+- ID → Word map
+- Word frequencies
+- Subsampling probabilities
+
+---
+
+## 3. 🪟 Windowed Skip-gram Pair Generator (src/dataset.py)
+
+```python
+import random
+
+def generate_skipgram_pairs(tokens, vocab, window_size=5):
+    indexed = [vocab.get(tok, 0) for tok in tokens]
+    for i, center in enumerate(indexed):
+        window = random.randint(1, window_size)
+        for j in range(max(0, i - window), min(len(indexed), i + window + 1)):
+            if i != j:
+                yield (center, indexed[j])
+```
+
+### Batching
+
+Build batches using a generator that yields `(center_batch, context_batch)` as PyTorch tensors.
+
+---
+
+## 4. 🧮 Negative Sampling Loss (src/model.py)
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SkipGramModel(nn.Module):
+    def __init__(self, vocab_size, embed_dim):
+        super().__init__()
+        self.in_embed = nn.Embedding(vocab_size, embed_dim)
+        self.out_embed = nn.Embedding(vocab_size, embed_dim)
+
+    def forward(self, center, context, negatives):
+        center_emb = self.in_embed(center)              # (B, D)
+        context_emb = self.out_embed(context)           # (B, D)
+        neg_emb = self.out_embed(negatives)             # (B, K, D)
+
+        pos_score = torch.sum(center_emb * context_emb, dim=1)  # (B,)
+        pos_loss = F.logsigmoid(pos_score)
+
+        neg_score = torch.bmm(neg_emb.neg(), center_emb.unsqueeze(2)).squeeze()  # (B, K)
+        neg_loss = F.logsigmoid(neg_score).sum(dim=1)
+
+        return -(pos_loss + neg_loss).mean()
+```
+
+Negative samples are drawn using **unigram distribution to the 3/4 power**.
+
+---
+
+## 5. 🚀 Pretraining Loop (src/train.py)
+
+```python
+def train(model, data_stream, optimizer, sampler, device):
+    model.train()
+    total_loss = 0
+    for centers, contexts, negatives in sampler:
+        centers, contexts, negatives = [x.to(device) for x in (centers, contexts, negatives)]
+        optimizer.zero_grad()
+        loss = model(centers, contexts, negatives)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss
+```
+
+### Optimization tricks:
+
+- Subsample frequent words with probability `P(w) = 1 - sqrt(t / f(w))`
+- Use torch `DataLoader` if you wrap your sampler into a Dataset
+- Save checkpoints every N steps to `checkpoints/pretrain_epoch_*.pt`
+
+---
+
+## 6. 💾 Save & Load Embeddings
+
+```python
+# To save:
+np.save("embeddings/word_vectors.npy", model.in_embed.weight.detach().cpu().numpy())
+
+# To load:
+model.in_embed.weight.data = torch.from_numpy(np.load("word_vectors.npy"))
+```
+
+---
+
+## 7. 🔁 Fine-tuning on Hacker News Titles (src/fine_tune.py)
+
+Same model architecture, same pipeline.
+
+**Strategies to avoid catastrophic forgetting:**
+
+- Lower LR (e.g., 1e-4 or 5e-5)
+- Freeze `out_embed`, only update `in_embed`
+- Fewer epochs
+- Optional: regularize toward pretrained weights (L2 penalty)
+
+```python
+for param in model.out_embed.parameters():
+    param.requires_grad = False
+```
+
+---
+
+## 8. ⚙️ Configuration (train_config.yaml)
+
+```yaml
+embed_dim: 100
+window_size: 5
+min_count: 5
+neg_samples: 10
+learning_rate: 0.002
+batch_size: 512
+epochs: 5
+```
+
+---
+
+## ✅ Reproducibility & Stability
+
+- Set `torch.manual_seed()` and `np.random.seed()` early
+- Use `torch.backends.cudnn.deterministic = True`
+- Save `vocab.pkl` alongside weights for downstream alignment
+
+---
+
+## 📌 Notes on Trade-offs
+
+| Design Choice               | Rationale / Trade-off                          |
+| --------------------------- | ---------------------------------------------- |
+| Skip-gram over CBOW         | Better with infrequent words, small corpus     |
+| Negative sampling           | Scales better than full softmax (esp. on GPU)  |
+| From-scratch batching       | Full control, no dependency on external tools  |
+| Subsampling high-freq words | Speeds up training, improves embedding quality |
+| Separate `in/out` matrices  | Improves semantic precision of embeddings      |
+
+---
+
+This plan is now ready for implementation.
+
+You want to start with corpus loading/tokenization, or straight into training code?
+</file>
+
+<file path="PLAN.md">
+# Implementation Plan
+
+## For Hacker News Upvote Predictor
+
+Version 0.1  
+Prepared by maxitect
+MLX Institute  
+April 16, 2025
+
+## Revision History
+
+| Name     | Date       | Reason For Changes | Version |
+| -------- | ---------- | ------------------ | ------- |
+| maxitect | 16/04/2025 | Initial draft      | 0.1     |
+
+## Implementation Tracking
+
+### Tracking Mechanism
+
+- Task ID format: [Section].[Subsection].[Task] (e.g., 1.2.3)
+- Status tracking (Not Started, In Progress, Completed)
+- Dependency tracking to ensure proper build sequence
+- Estimated implementation time: ≤1 hour per prompt
+- Review time: ≤15 minutes per task
+
+### Completion Criteria
+
+- [ ] All API endpoints implemented and functional
+- [ ] Word2Vec embeddings trained and evaluated
+- [ ] Prediction model trained and achieving MSE < 20
+- [ ] Docker container builds and runs successfully
+- [ ] Response time under 1 second for predictions
+- [ ] All logs persisted and retrievable
+- [ ] Documentation complete and accurate
+
+### Continuous Improvement
+
+- Regular code reviews after each component completion
+- Periodic performance evaluation of ML models
+- Security scanning of Docker configurations
+- Test coverage monitoring
+- Dependency updates as needed
+
+## Implementation Plan
+
+### 1. Project Setup
+
+**Objective:** Establish basic project structure and environment
+
+#### 1.1 Basic Project Structure
+
+- [ ] Task 1.1.1 - Create minimal project skeleton
+
+  - Depends on: None
+  - Creates: Basic directory structure with app folder, **init**.py, and placeholder main.py
+
+- [ ] Task 1.1.2 - Create requirements.txt
+
+  - Depends on: 1.1.1
+  - Creates: Basic requirements file with core dependencies (PyTorch, FastAPI, psycopg)
+
+- [ ] Task 1.1.3 - Create simple .gitignore
+  - Depends on: 1.1.1
+  - Creates: Basic .gitignore for Python project (\*.pyc, **pycache**, etc.)
+
+#### 1.2 Configuration Management
+
+- [ ] Task 1.2.1 - Create basic config module
+
+  - Depends on: 1.1.1
+  - Creates: app/config.py with basic configuration loading
+
+- [ ] Task 1.2.2 - Add database configuration
+  - Depends on: 1.2.1
+  - Adds: Database connection configuration to config.py
+
+### 2. Database Connectivity
+
+**Objective:** Implement basic database connection and data extraction
+
+#### 2.1 Database Connection
+
+- [ ] Task 2.1.1 - Create database connection module
+
+  - Depends on: 1.2.2
+  - Creates: app/utils/db_connection.py with basic connection function
+
+- [ ] Task 2.1.2 - Add connection pooling
+  - Depends on: 2.1.1
+  - Enhances: Database connection with proper pooling
+
+#### 2.2 Basic Data Extraction
+
+- [ ] Task 2.2.1 - Create function to extract post titles and scores
+
+  - Depends on: 2.1.2
+  - Creates: app/utils/data_extraction.py with function to extract basic post data
+
+- [ ] Task 2.2.2 - Add function to extract post metadata
+
+  - Depends on: 2.2.1
+  - Adds: Function to extract additional post metadata (author, timestamp, URL)
+
+- [ ] Task 2.2.3 - Create function to split data into train/val/test sets
+  - Depends on: 2.2.2
+  - Creates: Function to organise data for model training and evaluation
+
+### 3. Text Processing
+
+**Objective:** Implement basic text processing for titles
+
+#### 3.1 Basic Text Cleaning
+
+- [ ] Task 3.1.1 - Create text cleaning module
+
+  - Depends on: 1.1.1
+  - Creates: app/utils/text_processing.py with basic text cleaning functions
+
+- [ ] Task 3.1.2 - Add title preprocessing
+  - Depends on: 3.1.1
+  - Adds: Functions for title-specific preprocessing
+
+#### 3.2 Tokenisation
+
+- [ ] Task 3.2.1 - Create basic tokeniser
+
+  - Depends on: 3.1.2
+  - Creates: app/utils/tokeniser.py with functions to split text into tokens
+
+- [ ] Task 3.2.2 - Add vocabulary builder
+  - Depends on: 3.2.1
+  - Adds: Functions to build vocabulary from tokens
+
+### 4. Word2Vec Model
+
+**Objective:** Implement Word2Vec for word embeddings
+
+#### 4.1 Word2Vec Architecture
+
+- [ ] Task 4.1.1 - Create Word2Vec model skeleton
+
+  - Depends on: 3.2.2
+  - Creates: app/models/word2vec.py with basic model class
+
+- [ ] Task 4.1.2 - Implement embedding layer
+
+  - Depends on: 4.1.1
+  - Adds: Embedding layer implementation to Word2Vec model
+
+- [ ] Task 4.1.3 - Implement Skip-gram architecture
+  - Depends on: 4.1.2
+  - Adds: Complete Skip-gram model implementation
+
+#### 4.2 Training Utilities
+
+- [ ] Task 4.2.1 - Create context window extraction
+
+  - Depends on: 3.2.2
+  - Creates: Functions to extract context windows for Skip-gram training
+
+- [ ] Task 4.2.2 - Add data preparation for Word2Vec
+
+  - Depends on: 4.2.1
+  - Adds: Functions to prepare training data for Word2Vec
+
+- [ ] Task 4.2.3 - Implement basic training loop
+  - Depends on: 4.1.3, 4.2.2
+  - Creates: Basic training loop for Word2Vec model
+
+### 5. Feature Engineering
+
+**Objective:** Extract features for prediction model
+
+#### 5.1 Title Features
+
+- [ ] Task 5.1.1 - Create title length feature
+
+  - Depends on: 3.1.2
+  - Creates: app/features/title_features.py with function to extract title length
+
+- [ ] Task 5.1.2 - Implement title embedding averaging
+  - Depends on: 4.2.3
+  - Adds: Function to convert title to embedding by averaging word embeddings
+
+#### 5.2 Domain Features
+
+- [ ] Task 5.2.1 - Create domain extraction
+
+  - Depends on: 2.2.2
+  - Creates: app/features/domain_features.py with function to extract domains from URLs
+
+- [ ] Task 5.2.2 - Implement domain encoding
+  - Depends on: 5.2.1
+  - Adds: Function to encode domains as features
+
+#### 5.3 Time Features
+
+- [ ] Task 5.3.1 - Create time feature extraction
+
+  - Depends on: 2.2.2
+  - Creates: app/features/time_features.py with functions to extract day and hour
+
+- [ ] Task 5.3.2 - Implement cyclical encoding for time
+  - Depends on: 5.3.1
+  - Adds: Functions to encode time features cyclically (sin/cos)
+
+### 6. Prediction Model
+
+**Objective:** Implement neural network for upvote prediction
+
+#### 6.1 Model Architecture
+
+- [ ] Task 6.1.1 - Create prediction model skeleton
+
+  - Depends on: 5.1.2, 5.2.2, 5.3.2
+  - Creates: app/models/predictor.py with basic model class
+
+- [ ] Task 6.1.2 - Implement input processing
+
+  - Depends on: 6.1.1
+  - Adds: Functions to process and combine input features
+
+- [ ] Task 6.1.3 - Add neural network layers
+  - Depends on: 6.1.2
+  - Adds: Hidden layers and output layer to the model
+
+#### 6.2 Training
+
+- [ ] Task 6.2.1 - Create loss function and optimiser
+
+  - Depends on: 6.1.3
+  - Adds: MSE loss function and optimiser setup
+
+- [ ] Task 6.2.2 - Implement basic training loop
+
+  - Depends on: 6.2.1
+  - Creates: Basic training loop for prediction model
+
+- [ ] Task 6.2.3 - Add model evaluation
+  - Depends on: 6.2.2
+  - Adds: Functions to evaluate model on validation data
+
+#### 6.3 Model Persistence
+
+- [ ] Task 6.3.1 - Create model saving and loading
+
+  - Depends on: 6.1.3
+  - Adds: Functions to save and load model state
+
+- [ ] Task 6.3.2 - Implement version tracking
+  - Depends on: 6.3.1
+  - Creates: app/utils/versioning.py for model version tracking
+
+### 7. API Implementation
+
+**Objective:** Create FastAPI application with required endpoints
+
+#### 7.1 Basic API Setup
+
+- [ ] Task 7.1.1 - Create FastAPI application skeleton
+
+  - Depends on: 1.1.1
+  - Creates: Basic FastAPI app in app/main.py
+
+- [ ] Task 7.1.2 - Add request/response models
+  - Depends on: 7.1.1
+  - Creates: app/schemas.py with Pydantic models
+
+#### 7.2 Basic Endpoints
+
+- [ ] Task 7.2.1 - Implement /ping endpoint
+
+  - Depends on: 7.1.1
+  - Adds: Simple health check endpoint
+
+- [ ] Task 7.2.2 - Implement /version endpoint
+  - Depends on: 6.3.2, 7.1.1
+  - Adds: Endpoint to return model version
+
+#### 7.3 Prediction Endpoint
+
+- [ ] Task 7.3.1 - Create prediction service
+
+  - Depends on: 6.3.1
+  - Creates: app/services/prediction.py with prediction logic
+
+- [ ] Task 7.3.2 - Implement /how_many_upvotes endpoint
+  - Depends on: 7.1.2, 7.3.1
+  - Adds: Endpoint for upvote prediction
+
+### 8. Logging System
+
+**Objective:** Implement request and prediction logging
+
+#### 8.1 Logging Setup
+
+- [ ] Task 8.1.1 - Create basic logging configuration
+
+  - Depends on: 1.2.1
+  - Creates: app/utils/logging_utils.py with basic setup
+
+- [ ] Task 8.1.2 - Implement file logging
+  - Depends on: 8.1.1
+  - Adds: Configuration for logging to files
+
+#### 8.2 Request Logging
+
+- [ ] Task 8.2.1 - Create request logging middleware
+
+  - Depends on: 7.1.1, 8.1.2
+  - Adds: Middleware to log API requests
+
+- [ ] Task 8.2.2 - Implement prediction logging
+  - Depends on: 7.3.2, 8.1.2
+  - Adds: Detailed logging for predictions
+
+#### 8.3 Log Retrieval
+
+- [ ] Task 8.3.1 - Create log reading function
+
+  - Depends on: 8.2.2
+  - Adds: Function to read and parse log files
+
+- [ ] Task 8.3.2 - Implement /logs endpoint
+  - Depends on: 7.1.1, 8.3.1
+  - Adds: Endpoint to retrieve logs
+
+### 9. Containerisation
+
+**Objective:** Create Docker configuration for deployment
+
+#### 9.1 Dockerfile
+
+- [ ] Task 9.1.1 - Create basic Dockerfile
+
+  - Depends on: 1.1.2
+  - Creates: Basic Dockerfile for the application
+
+- [ ] Task 9.1.2 - Add multi-stage build
+  - Depends on: 9.1.1
+  - Enhances: Dockerfile with multi-stage build for optimisation
+
+#### 9.2 Docker Compose
+
+- [ ] Task 9.2.1 - Create basic docker-compose.yml
+
+  - Depends on: 9.1.2
+  - Creates: Basic Docker Compose configuration
+
+- [ ] Task 9.2.2 - Add volume configuration for logs
+  - Depends on: 9.2.1
+  - Adds: Volume mount for persistent logs
+
+### 10. Integration and Documentation
+
+**Objective:** Finalise integration and documentation
+
+#### 10.1 Training Scripts
+
+- [ ] Task 10.1.1 - Create Word2Vec training script
+
+  - Depends on: 4.2.3
+  - Creates: scripts/train_word2vec.py for word embedding training
+
+- [ ] Task 10.1.2 - Create prediction model training script
+  - Depends on: 6.2.3
+  - Creates: scripts/train_predictor.py for model training
+
+#### 10.2 Documentation
+
+- [ ] Task 10.2.1 - Create comprehensive README
+
+  - Depends on: All previous tasks
+  - Creates: Detailed README.md with project documentation
+
+- [ ] Task 10.2.2 - Add API documentation
+  - Depends on: 7.2.1, 7.2.2, 7.3.2, 8.3.2
+  - Creates: API documentation with examples
+
+## Implementation Prompts
+
+### Project Setup
+
+#### Task 1.1.1: Create minimal project skeleton
+
+```
+Create the minimal project skeleton for the Hacker News Upvote Predictor. Set up:
+
+1. Root directory
+2. app/ directory
+3. app/__init__.py (empty file)
+4. app/main.py (with a placeholder comment)
+5. Empty Dockerfile
+
+This is just the basic structure to get started. We'll fill in these files in later steps.
+```
+
+#### Task 1.1.2: Create requirements.txt
+
+```
+Create a requirements.txt file with the core dependencies for the project:
+
+pytorch>=2.1.0
+fastapi>=0.104.0
+uvicorn>=0.23.2
+psycopg>=3.1.12
+pydantic>=2.4.2
+python-dotenv>=1.0.0
+numpy>=1.24.0
+wandb>=0.15.12
+
+Include just these essential packages for now. We'll add more specific dependencies as needed.
+```
+
+#### Task 1.1.3: Create simple .gitignore
+
+```
+Create a .gitignore file appropriate for this Python project. Include patterns for:
+
+1. Python bytecode and cache files
+2. Virtual environments
+3. Editor/IDE specific files
+4. Local configuration files
+5. Model checkpoints and large data files
+6. Log files
+
+Keep it focused on the essentials for this project.
+```
+
+#### Task 1.2.1: Create basic config module
+
+```
+Create a basic config.py module in the app directory that:
+
+1. Imports os and dotenv
+2. Has a function to load environment variables
+3. Defines default configuration values
+4. Has a get_config() function that returns a config dictionary
+
+This should be a minimal implementation focused on loading basic configuration.
+```
+
+#### Task 1.2.2: Add database configuration
+
+```
+Enhance the config.py module to include database configuration:
+
+1. Add the default database URL from BRIEF.md
+2. Handle database connection parameters (host, port, user, password, dbname)
+3. Add validation for database configuration
+4. Provide a get_db_config() function
+
+Ensure the connection string from BRIEF.md is used as the default.
+```
+
+### Database Connectivity
+
+#### Task 2.1.1: Create database connection module
+
+```
+Create a db_connection.py module in app/utils/ that:
+
+1. Imports the config module
+2. Implements a simple function to create a connection to the PostgreSQL database
+3. Has a function to test if the connection works
+4. Includes basic error handling
+
+Focus on establishing a basic connection using the configuration from config.py.
+```
+
+#### Task 2.1.2: Add connection pooling
+
+```
+Enhance the db_connection.py module to add connection pooling:
+
+1. Create a connection pool instead of individual connections
+2. Add a function to get a connection from the pool
+3. Implement a context manager for safe connection handling
+4. Add a function to close the pool properly on shutdown
+
+Keep the implementation focused on proper resource management.
+```
+
+#### Task 2.2.1: Create function to extract post titles and scores
+
+```
+Create a data_extraction.py module in app/utils/ that:
+
+1. Imports the db_connection module
+2. Implements a function to extract post titles and scores from the database
+3. Includes parameter validation and SQL injection prevention
+4. Has basic error handling
+5. Returns results in a simple dictionary format
+
+Focus on safely extracting the core data needed for the model.
+```
+
+#### Task 2.2.2: Add function to extract post metadata
+
+```
+Enhance the data_extraction.py module to add metadata extraction:
+
+1. Create a function to extract post URLs, authors, and timestamps
+2. Add a function to join basic data with metadata
+3. Include proper error handling for missing fields
+4. Return results in a consistent format
+
+Ensure all the data needed for feature engineering is extracted properly.
+```
+
+#### Task 2.2.3: Create function to split data
+
+```
+Create a data_utils.py module in app/utils/ that:
+
+1. Imports necessary utilities
+2. Implements a function to split data into training, validation, and test sets
+3. Uses a 70%/15%/15% split ratio
+4. Ensures consistent results with a fixed random seed
+5. Returns the split datasets in a suitable format
+
+Keep the implementation simple while ensuring proper data organisation.
+```
+
+### Text Processing
+
+#### Task 3.1.1: Create text cleaning module
+
+```
+Create a text_processing.py module in app/utils/ that:
+
+1. Implements functions for basic text cleaning:
+   - Convert to lowercase
+   - Remove extra whitespace
+   - Handle basic punctuation
+2. Has a clean_text() function that applies all preprocessing steps
+3. Includes proper error handling for edge cases
+
+Focus on core text cleaning operations required for tokenisation.
+```
+
+#### Task 3.1.2: Add title preprocessing
+
+```
+Enhance the text_processing.py module to add title-specific preprocessing:
+
+1. Add functions to normalise common patterns in HN titles
+2. Implement handling for special characters and symbols
+3. Create a function to extract the title length as a feature
+4. Add a preprocess_title() function that applies all title-specific steps
+
+Focus on preparing titles for effective tokenisation and feature extraction.
+```
+
+#### Task 3.2.1: Create basic tokeniser
+
+```
+Create a tokeniser.py module in app/utils/ that:
+
+1. Imports the text_processing module
+2. Implements a function to split text into tokens
+3. Handles basic token normalisation
+4. Has proper error handling for edge cases
+5. Returns a list of tokens for a given text
+
+Focus on creating a simple but effective tokeniser following the BRIEF.md guidelines.
+```
+
+#### Task 3.2.2: Add vocabulary builder
+
+```
+Enhance the tokeniser.py module to add vocabulary building:
+
+1. Create a Vocabulary class to manage token-to-id mapping
+2. Implement functions to build vocabulary from a corpus
+3. Add special token handling (PAD, UNK, etc.)
+4. Include methods to convert between tokens and IDs
+5. Add functions to save and load the vocabulary
+
+Focus on establishing the foundation for Word2Vec input preparation.
+```
+
+### Word2Vec Model
+
+#### Task 4.1.1: Create Word2Vec model skeleton
+
+```
+Create a word2vec.py module in app/models/ that:
+
+1. Imports PyTorch and necessary utilities
+2. Defines a basic Word2Vec class that extends nn.Module
+3. Implements __init__ with configuration parameters
+4. Adds placeholder methods for forward pass
+5. Includes docstrings explaining the intended architecture
+
+Create just the skeleton - we'll implement the layers in subsequent tasks.
+```
+
+#### Task 4.1.2: Implement embedding layer
+
+```
+Enhance the word2vec.py module to implement the embedding layer:
+
+1. Add an embedding layer in the __init__ method
+2. Set up proper initialisation for the embeddings
+3. Include configuration for embedding dimension
+4. Add a method to get embeddings for specific tokens
+5. Include proper error handling
+
+Focus on correctly implementing the embedding layer for the Word2Vec model.
+```
+
+#### Task 4.1.3: Implement Skip-gram architecture
+
+```
+Complete the word2vec.py module by implementing the Skip-gram architecture:
+
+1. Add the output projection layer
+2. Implement the forward method for context prediction
+3. Create a method to compute the loss with negative sampling
+4. Add a predict_context method for inference
+5. Include proper handling of batched inputs
+
+Focus on implementing the core Skip-gram model as described in BRIEF.md.
+```
+
+#### Task 4.2.1: Create context window extraction
+
+```
+Create a context_window.py module in app/utils/ that:
+
+1. Implements a function to extract context windows from token sequences
+2. Creates a function to generate (target, context) pairs for Skip-gram training
+3. Handles edge cases like short sequences
+4. Includes configurable context window sise
+5. Has proper error handling
+
+Focus on preparing the data structure needed for Skip-gram training.
+```
+
+#### Task 4.2.2: Add data preparation for Word2Vec
+
+```
+Create a word2vec_data.py module in app/utils/ that:
+
+1. Imports the tokeniser and context_window modules
+2. Implements a function to prepare training data from text
+3. Creates batches of (target, context) pairs
+4. Handles conversion to PyTorch tensors
+5. Includes proper error handling and validation
+
+Focus on preparing properly formatted data for Word2Vec training.
+```
+
+#### Task 4.2.3: Implement basic training loop
+
+```
+Create a word2vec_training.py module in app/training/ that:
+
+1. Imports the Word2Vec model and data preparation utilities
+2. Implements a basic training loop for Word2Vec
+3. Uses Adam optimiser with a configurable learning rate
+4. Includes progress tracking and basic logging
+5. Has a function to save the trained model
+
+Focus on implementing a functional training loop for the Word2Vec model.
+```
+
+### Feature Engineering
+
+#### Task 5.1.1: Create title length feature
+
+```
+Create a title_features.py module in app/features/ that:
+
+1. Imports necessary utilities
+2. Implements a function to extract title length as a feature
+3. Normalises title length based on findings in REPORT.md
+4. Handles edge cases (very short/long titles)
+5. Returns normalised features in a suitable format
+
+Focus on implementing the title length feature identified in REPORT.md.
+```
+
+#### Task 5.1.2: Implement title embedding averaging
+
+```
+Enhance the title_features.py module to add title embedding functionality:
+
+1. Import the Word2Vec model utilities
+2. Implement a function to convert a title to tokens
+3. Create a function to get embeddings for each token
+4. Add a function to average word embeddings for a title
+5. Include proper handling of out-of-vocabulary words
+
+Focus on converting titles to a fixed-dimensional representation for the prediction model.
+```
+
+#### Task 5.2.1: Create domain extraction
+
+```
+Create a domain_features.py module in app/features/ that:
+
+1. Implements a function to extract domains from URLs
+2. Normalises domains (lowercase, remove www.)
+3. Handles posts without URLs with a special token
+4. Creates a function to build a domain vocabulary
+5. Includes proper error handling for malformed URLs
+
+Focus on implementing domain extraction as per REPORT.md findings.
+```
+
+#### Task 5.2.2: Implement domain encoding
+
+```
+Enhance the domain_features.py module to add domain encoding:
+
+1. Create a function to convert domains to IDs using a vocabulary
+2. Implement a method to get one-hot encoded domains
+3. Add functionality for domain reputation based on historical performance
+4. Handle unknown domains properly
+5. Include functions to save and load domain encodings
+
+Focus on converting domains to a format suitable for the prediction model.
+```
+
+#### Task 5.3.1: Create time feature extraction
+
+```
+Create a time_features.py module in app/features/ that:
+
+1. Implements functions to extract day of week from timestamps
+2. Adds a function to extract hour of day
+3. Handles timezone conversion if needed
+4. Creates a function to format time features
+5. Includes proper error handling for invalid timestamps
+
+Focus on extracting the time-based features identified in REPORT.md.
+```
+
+#### Task 5.3.2: Implement cyclical encoding for time
+
+```
+Enhance the time_features.py module to add cyclical encoding:
+
+1. Import math utilities (sin, cos)
+2. Implement functions for sine/cosine encoding of:
+   - Hour of day (0-23)
+   - Day of week (0-6)
+3. Add a function to combine cyclical features
+4. Create a function to get all time features for a timestamp
+5. Include proper validation and error handling
+
+Focus on properly representing periodic time features for the prediction model.
+```
+
+### Prediction Model
+
+#### Task 6.1.1: Create prediction model skeleton
+
+```
+Create a predictor.py module in app/models/ that:
+
+1. Imports PyTorch and necessary utilities
+2. Defines a basic UpvotePredictor class that extends nn.Module
+3. Implements __init__ with configuration parameters
+4. Adds placeholder methods for forward pass
+5. Includes docstrings explaining the intended architecture
+
+Create just the skeleton - we'll implement the layers in subsequent tasks.
+```
+
+#### Task 6.1.2: Implement input processing
+
+```
+Enhance the predictor.py module to implement input processing:
+
+1. Add methods to process different feature types:
+   - Title embeddings
+   - Domain features
+   - Time features
+2. Create a function to combine features
+3. Implement normalisation for combined features
+4. Add proper error handling for invalid inputs
+5. Include logging for debugging
+
+Focus on properly handling and combining the various input features.
+```
+
+#### Task 6.1.3: Add neural network layers
+
+```
+Complete the predictor.py module by implementing the neural network:
+
+1. Create a domain embedding layer
+2. Add 2-3 hidden layers with ReLU activations
+3. Implement dropout for regularisation
+4. Create the final output layer (single neuron)
+5. Complete the forward method to process inputs through the network
+
+Focus on implementing the neural network architecture described in SPEC.md.
+```
+
+#### Task 6.2.1: Create loss function and optimiser
+
+```
+Create a predictor_training.py module in app/training/ that:
+
+1. Imports the UpvotePredictor model
+2. Implements MSE loss function setup
+3. Creates an optimiser configuration (Adam)
+4. Adds learning rate scheduling
+5. Includes proper initialisation
+
+Focus on setting up the training components for the prediction model.
+```
+
+#### Task 6.2.2: Implement basic training loop
+
+```
+Enhance the predictor_training.py module to add the training loop:
+
+1. Implement a function to train for one epoch
+2. Create a function for the complete training process
+3. Add batch processing of training data
+4. Include progress tracking and logging
+5. Implement checkpoint saving during training
+
+Focus on implementing a functional training loop for the prediction model.
+```
+
+#### Task 6.2.3: Add model evaluation
+
+```
+Enhance the predictor_training.py module to add evaluation:
+
+1. Implement a function to evaluate on validation data
+2. Add MSE calculation for model performance
+3. Create a function to track best model performance
+4. Implement early stopping based on validation loss
+5. Add functionality to restore the best model
+
+Focus on properly evaluating the model during and after training.
+```
+
+#### Task 6.3.1: Create model saving and loading
+
+```
+Create a model_io.py module in app/utils/ that:
+
+1. Implements functions to save model state:
+   - Save weights
+   - Save architecture configuration
+   - Save metadata (training info)
+2. Creates functions to load a saved model
+3. Adds versioning to saved models
+4. Includes proper error handling
+5. Has functions to check if a model exists
+
+Focus on reliable model persistence for later deployment and inference.
+```
+
+#### Task 6.3.2: Implement version tracking
+
+```
+Create a versioning.py module in app/utils/ that:
+
+1. Implements a VersionTracker class
+2. Uses semantic versioning (major.minor.patch)
+3. Stores version history in a JSON file
+4. Has functions to get and update the current version
+5. Includes proper error handling
+
+Focus on tracking model versions for the API to report correctly.
+```
+
+### API Implementation
+
+#### Task 7.1.1: Create FastAPI application skeleton
+
+```
+Update the app/main.py file to implement a basic FastAPI application:
+
+1. Import FastAPI and related utilities
+2. Create the FastAPI application instance
+3. Add basic configuration and metadata
+4. Set up error handling
+5. Include health check logic
+
+Focus on setting up the foundation for the API endpoints.
+```
+
+#### Task 7.1.2: Add request/response models
+
+```
+Create a schemas.py module in app/ that:
+
+1. Imports Pydantic and related utilities
+2. Defines a model for prediction requests:
+   - author field (string)
+   - title field (string)
+   - timestamp field (string)
+3. Creates a model for prediction responses:
+   - upvotes field (float)
+4. Adds validation for required fields
+5. Includes models for other endpoint responses
+
+Focus on properly validating API inputs and outputs.
+```
+
+#### Task 7.2.1: Implement /ping endpoint
+
+```
+Enhance the app/main.py file to add the /ping endpoint:
+
+1. Import necessary utilities
+2. Implement the endpoint:
+   - GET method
+   - Returns "ok" string
+   - Includes docstring for OpenAPI documentation
+3. Add simple logging for the endpoint
+4. Include proper error handling
+
+Focus on implementing the simple health check endpoint specified in BRIEF.md.
+```
+
+#### Task 7.2.2: Implement /version endpoint
+
+```
+Enhance the app/main.py file to add the /version endpoint:
+
+1. Import the versioning module
+2. Implement the endpoint:
+   - GET method
+   - Returns {"version": "x.y.z"} format
+   - Includes docstring for OpenAPI documentation
+3. Add proper error handling
+4. Include logging for the endpoint
+
+Focus on implementing the version endpoint specified in BRIEF.md.
+```
+
+#### Task 7.3.1: Create prediction service
+
+```
+Create a prediction.py module in app/services/ that:
+
+1. Imports the predictor model and feature utilities
+2. Implements a function to preprocess prediction inputs
+3. Creates a predict_upvotes function that:
+   - Takes title, author, timestamp inputs
+   - Preprocesses the inputs
+   - Runs the prediction model
+   - Returns the predicted upvote count
+4. Includes proper error handling
+5. Adds logging for debugging
+
+Focus on encapsulating the prediction logic for use by the API endpoint.
+```
+
+#### Task 7.3.2: Implement /how_many_upvotes endpoint
+
+```
+Enhance the app/main.py file to add the /how_many_upvotes endpoint:
+
+1. Import the prediction service and schemas
+2. Implement the endpoint:
+   - POST method
+   - Takes UpvotePredictionRequest
+   - Returns UpvotePredictionResponse
+   - Includes docstring for OpenAPI documentation
+3. Add proper error handling for prediction failures
+4. Include timing measurement for latency logging
+
+Focus on implementing the main prediction endpoint specified in BRIEF.md.
+```
+
+### Logging System
+
+#### Task 8.1.1: Create basic logging configuration
+
+```
+Create a logging_utils.py module in app/utils/ that:
+
+1. Imports the logging module and related utilities
+2. Implements a function to configure basic logging
+3. Sets up console logging with appropriate format
+4. Creates different log levels (DEBUG, INFO, ERROR)
+5. Includes proper error handling
+
+Focus on establishing a basic logging foundation for the application.
+```
+
+#### Task 8.1.2: Implement file logging
+
+```
+Enhance the logging_utils.py module to add file logging:
+
+1. Add a function to set up file logging
+2. Implement log rotation based on size
+3. Create a function to ensure the log directory exists
+4. Add a formatter for structured JSON logs
+5. Include proper error handling
+
+Focus on implementing persistent logging to files as specified in BRIEF.md.
+```
+
+#### Task 8.2.1: Create request logging middleware
+
+```
+Create a middleware.py module in app/ that:
+
+1. Imports FastAPI middleware utilities and logging_utils
+2. Implements request logging middleware:
+   - Logs request method, path, and headers
+   - Measures request processing time
+   - Logs response status code
+3. Adds the middleware to the application
+4. Includes proper error handling
+
+Focus on capturing basic information about all API requests.
+```
+
+#### Task 8.2.2: Implement prediction logging
+
+```
+Enhance the prediction service to add detailed prediction logging:
+
+1. Import logging utilities
+2. Implement a function to log prediction details:
+   - Request inputs
+   - Prediction output
+   - Latency
+   - Timestamp
+   - Model version
+3. Save logs in the format specified in BRIEF.md
+4. Include proper error handling
+
+Focus on logging prediction details as specified in BRIEF.md.
+```
+
+#### Task 8.3.1: Create log reading function
+
+```
+Create a log_reader.py module in app/utils/ that:
+
+1. Implements a function to read log files
+2. Parses JSON-formatted logs
+3. Adds filtering capabilities
+4. Includes proper error handling for missing or corrupt logs
+5. Returns logs in a format suitable for the API
+
+Focus on reliably reading and parsing log files for the /logs endpoint.
+```
+
+#### Task 8.3.2: Implement /logs endpoint
+
+```
+Enhance the app/main.py file to add the /logs endpoint:
+
+1. Import the log_reader module
+2. Implement the endpoint:
+   - GET method
+   - Returns {"logs": [...]} format
+   - Includes docstring for OpenAPI documentation
+3. Add proper error handling for log reading failures
+4. Include logging for the endpoint itself
+
+Focus on implementing the logs endpoint specified in BRIEF.md.
+```
+
+### Containerisation
+
+#### Task 9.1.1: Create basic Dockerfile
+
+```
+Create a Dockerfile in the project root that:
+
+1. Uses Python 3.13.3 slim as the base image
+2. Sets up the working directory
+3. Copies and installs requirements
+4. Copies the application code
+5. Sets up environment variables
+6. Defines the command to run the application
+7. Includes proper documentation in comments
+
+Focus on creating a basic but functional Dockerfile for the application.
+```
+
+#### Task 9.1.2: Add multi-stage build
+
+```
+Enhance the Dockerfile to implement a multi-stage build:
+
+1. Use a builder stage for dependencies
+2. Optimize the final image sise
+3. Implement proper caching
+4. Add security hardening
+5. Create a non-root user for the application
+6. Include proper documentation in comments
+
+Focus on optimising the container for production deployment.
+```
+
+#### Task 9.2.1: Create basic docker-compose.yml
+
+```
+Create a docker-compose.yml file in the project root that:
+
+1. Defines the application service
+2. Sets up port mapping
+3. Configures environment variables
+4. Implements healthcheck
+5. Adds restart policy
+6. Includes proper documentation in comments
+
+Focus on creating a basic but functional Docker Compose configuration.
+```
+
+#### Task 9.2.2: Add volume configuration for logs
+
+```
+Enhance the docker-compose.yml file to add volume configuration:
+
+1. Define a volume for logs
+2. Mount the volume in the application service
+3. Configure appropriate permissions
+4. Add log rotation configuration
+5. Implement proper volume naming
+6. Include proper documentation in comments
+
+Focus on ensuring logs are persisted across container restarts as specified in BRIEF.md.
+```
+
+### Integration and Documentation
+
+#### Task 10.1.1: Create Word2Vec training script
+
+```
+Create a train_word2vec.py script in a scripts/ directory that:
+
+1. Imports the Word2Vec model and utilities
+2. Implements a function to download and process the text8 dataset
+3. Creates a training script with command-line arguments
+4. Adds progress tracking and visualisation
+5. Implements model saving
+6. Includes proper error handling and documentation
+
+Focus on creating a usable script for training the Word2Vec model.
+```
+
+#### Task 10.1.2: Create prediction model training script
+
+```
+Create a train_predictor.py script in the scripts/ directory that:
+
+1. Imports the prediction model and utilities
+2. Implements data loading from the database
+3. Creates a training script with command-line arguments
+4. Adds progress tracking and visualisation
+5. Implements model saving and evaluation
+6. Includes proper error handling and documentation
+
+Focus on creating a usable script for training the prediction model.
+```
+
+#### Task 10.2.1: Create comprehensive README
+
+```
+Create a comprehensive README.md in the project root that:
+
+1. Provides a project overview and problem statement
+2. Documents the setup process:
+   - Environment creation
+   - Database connection
+   - Running the application
+3. Explains the machine learning approach
+4. Documents the API endpoints
+5. Describes the Docker deployment
+6. Includes troubleshooting tips
+7. Adds references and acknowledgments
+
+Focus on creating clear, comprehensive documentation for the project.
+```
+
+#### Task 10.2.2: Add API documentation
+
+```
+Create an API.md file in the project root that:
+
+1. Documents each API endpoint:
+   - /ping
+   - /version
+   - /logs
+   - /how_many_upvotes
+2. Includes request and response examples
+3. Documents error responses
+4. Provides usage tips
+5. Adds performance considerations
+
+Focus on creating clear documentation for the API endpoints.
+```
+</file>
+
+<file path="REPORT.md">
+# Hacker News Upvote Prediction Model: Data Analysis Report
+
+## Key Findings
+
+### Content Factors
+
+- **Title Length**: Optimal range is 25-75 characters (13.5-16.5 avg score). Titles >100 characters perform significantly worse (5.5 avg score). Correlation is weakly negative (-0.01).
+
+- **Domain Quality**: Highly specialised technical/educational domains consistently outperform others. Top domain (ciechanow.ski) achieves 444 avg score vs platform average of 14.
+
+- **Content Type**: News domains slightly outperform non-news (18 vs 15 avg score).
+
+### Author Factors
+
+- **Author Experience**: Inverse relationship between post frequency and score for casual posters. Prolific posters (1000+ posts) show marginal improvement (15.7 avg score).
+
+- **Karma Levels**: Mid-level karma users (100-500) achieve highest scores (32.3). Interestingly, high-karma authors (50,000+) perform below average (14.7).
+
+- **Karma Impact**: Historical correlation between karma and score has declined steadily since 2010, now approaching zero.
+
+### Timing Factors
+
+- **Day of Week**: Weekend posts significantly outperform weekdays (Sunday: 16.2, Weekdays: ~13.0).
+
+- **Time of Day**: Posts around noon/early afternoon perform best (14.5 avg score). Early morning posts (7-8am) perform worst (11.8).
+
+- **Year Trends**: Average scores have increased steadily from 6.0 in 2006 to 17.3 in 2023, with a slight decline in 2024 (15.3).
+
+## Recommendations for Model Features
+
+### Must-Have Features
+
+1. **Domain-Based**:
+
+   - Domain reputation score (based on historical performance)
+   - Dataset should be current (< 5 years old)
+
+2. **Content-Based**:
+
+   - Title length (with nonlinear encoding for 25-75 char sweet spot)
+   - Title content (using word2vec)
+   - Dataset should be current (< 5 years old)
+
+3. **Timing-Based**:
+
+   - Day of week (with weekend emphasis)
+   - Hour of posting (with emphasis on noon-2pm peak)
+   - Use all data available
+
+## Deliberately Excluded
+
+- **Author karma**: Despite conventional wisdom, shows very weak correlation (-0.02)
+- **Author post frequency**: Minimal ßpredictive value (correlation 0.01)
+- **Year trends**: While interesting historically, provides little predictive value for new posts
+
+The data clearly shows domain quality and timing factors dominate prediction power, while author-based metrics have surprisingly little impact on outcomes.
+
+The strongest predictor appears to be domain quality, followed by timing factors. Author karma - despite conventional wisdom - shows limited predictive value in recent data.
+</file>
+
+<file path="STANDARDS.md">
+# Project Standards and Implementation Plan
+
+## For Hacker News Upvote Predictor
+
+Version 0.1  
+Prepared by maxitect
+April 16, 2025
+
+## Revision History
+
+| Name     | Date           | Reason For Changes | Version |
+| -------- | -------------- | ------------------ | ------- |
+| maxitect | April 16, 2025 | Initial draft      | 0.1     |
+
+## 1. Development Methodology
+
+### 1.1 Chosen Methodology
+
+- Rapid development with clear deliverable milestones
+- 3-day timeline with focused completion of major components:
+  - Data retrieval and preparation
+  - Word embedding training
+  - Prediction model development
+  - API implementation
+  - Containerisation
+  - Deployment
+- Daily standups to review progress and address blockers
+- Emphasis on learning ML concepts whilst meeting deliverables
+
+### 1.2 Team Structure
+
+- Small team of ML newcomers with varied technical backgrounds
+- Clear component ownership with collaborative learning sessions
+- Monolithic architecture with logical module boundaries to manage complexity
+
+## 2. Coding Standards
+
+### 2.1 General Coding Principles
+
+- Prioritise readability and maintainability over optimisation
+- Follow PEP 8 coding style for all Python code
+- Use flake8 linter in VS Code to enforce standards
+- Apply KISS (Keep It Simple, Stupid) principles throughout
+- Use type hints where appropriate to improve code clarity
+- Apply clear separation between data access, model, and API layers
+- Utilise descriptive variable and function names that reflect purpose
+- Use comments sparingly, only when code is not self-explanatory
+- Include docstrings for all public functions and classes
+- Limit function complexity (aim for <25 lines per function)
+- Maintain modular design with clear interfaces between components
+
+### 2.2 Language-Specific Standards
+
+#### 2.2.1 Python Standards
+
+- Python 3.13.3 as standard language version
+- Consistent import ordering: standard library, third-party, local
+- Use of environment variables for configuration
+- Error handling with appropriate exception types
+- No wildcard imports (avoid `from module import *`)
+
+#### 2.2.2 PyTorch Standards
+
+- Layer definitions should follow PyTorch conventions
+- Use nn.Module for model components
+- Consistent tensor dimensioning and device handling
+- Clear separation between model definition and training loop
+- Explicit handling of model states (train/eval modes)
+
+#### 2.2.3 FastAPI Standards
+
+- RESTful API design following project brief
+- Input validation using Pydantic models
+- Clear endpoint path naming
+- Consistent HTTP status codes and error responses
+- Proper request/response documentation
+
+#### 2.2.4 Database Standards
+
+- Use of PostgreSQL connection pooling for efficiency
+- Parameterised queries to prevent SQL injection
+- Explicit transaction management
+- Clear data model definitions
+
+### 2.3 Code Review Process
+
+- Feature branch PRs require at least one reviewer before merging
+- Focus reviews on correctness, maintainability, and adherence to standards
+- Use collaborative sessions for knowledge sharing during reviews
+- Prioritise quick feedback loops to maintain development momentum
+
+## 3. Version Control
+
+### 3.1 Repository Management
+
+- Feature branch workflow:
+  - Main branch protected, no direct commits
+  - Create feature branches for each component or feature
+  - Use pull requests to merge changes back to main
+  - Delete feature branches after successful merge
+- Regular commits to facilitate collaboration and code reviews
+
+### 3.2 Commit Standards
+
+- Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
+- Clear, descriptive commit messages following the format:
+  - `feat:` for new features
+  - `fix:` for bug fixes
+  - `docs:` for documentation changes
+  - `style:` for formatting changes
+  - `refactor:` for code changes that neither fix nor add features
+  - `test:` for adding or modifying tests
+  - `chore:` for maintenance tasks
+- Logical, atomic commits that represent complete changes
+- Include reference to project component in commit message
+- Avoid committing sensitive information (connection strings, credentials)
+
+## 4. Testing Strategy
+
+### 4.1 Testing Types
+
+- Model evaluation:
+  - Test set evaluation with MSE metrics (target: MSE < 20.0)
+  - Comparison against baseline models
+  - Validation on representative examples
+- API testing:
+  - Endpoint functionality tests
+  - Response time measurements
+  - Error handling validation
+- Integration testing:
+  - End-to-end pipeline validation
+  - Database interaction testing
+
+### 4.2 Test Coverage
+
+- Focus on critical paths:
+  - Word embedding quality
+  - Prediction accuracy
+  - API response correctness
+  - Data flow through the system
+- Manual validation acceptable given timeline constraints
+
+### 4.3 Continuous Integration
+
+- GitHub Actions workflow for:
+  - Verify model loading
+  - Test API endpoints
+  - Check database connectivity
+  - Validate Docker container startup
+  - Deploy to target environment on successful tests
+
+## 5. Quality Assurance
+
+### 5.1 Code Quality
+
+- Use of flake8 for basic code quality
+- Regular code walkthroughs for knowledge sharing
+- Focus on maintainability and clarity given the learning context
+- Documentation of known limitations and design decisions
+
+### 5.2 Performance Monitoring
+
+- Track key performance metrics:
+  - Model inference time (target: <1 second)
+  - API response time (target: <1 second)
+  - Database query performance
+  - Model prediction accuracy (MSE)
+- Log latency measurements for each prediction request
+
+## 6. Technical Debt Management
+
+### 6.1 Identification
+
+- Document known limitations in project README
+- Track prioritised improvements in a simple backlog
+- Distinguish between learning opportunities and critical fixes
+- Focus on completing core functionality before optimisation
+
+### 6.2 Mitigation Strategies
+
+- Clear code organisation to facilitate future improvements
+- Documentation of design decisions and trade-offs
+- Modular architecture to allow component replacement
+- Explicit handling of edge cases with appropriate messaging
+
+## 7. Implementation Roadmap
+
+### 7.1 Project Phases
+
+- Day 1:
+
+  - Morning: Project setup and database connection
+  - Afternoon: Data extraction and basic feature engineering
+  - Evening: Word2Vec implementation and training
+
+- Day 2:
+
+  - Morning: Neural network model implementation
+  - Afternoon: Model training and evaluation
+  - Evening: API development and basic endpoint testing
+
+- Day 3:
+  - Morning: Integration of all components and testing
+  - Afternoon: Containerisation and deployment prep
+  - Evening: Final testing, documentation, and deployment
+
+### 7.2 Milestones
+
+- M1: Database connection and data extraction working
+- M2: Word2Vec embeddings trained and evaluated
+- M3: Prediction model trained with acceptable MSE
+- M4: API endpoints implemented and tested
+- M5: Full system integration completed
+- M6: Containerised application deployed
+- M7: Documentation and handover completed
+
+### 7.3 Resource Allocation
+
+- Team members assigned to components based on skills
+- Collaborative sessions for knowledge sharing on ML concepts
+- Focus effort on high-value components first
+
+## 8. Documentation Standards
+
+### 8.1 Code Documentation
+
+- Clear function and class docstrings
+- Type hints for function signatures
+- Inline comments for complex logic only
+- References to relevant research papers or articles
+
+### 8.2 External Documentation
+
+- Comprehensive README with:
+  - Project overview and purpose
+  - Architecture description
+  - Setup instructions
+  - Usage examples
+  - Performance metrics
+  - Known limitations
+- API documentation via FastAPI's built-in Swagger UI
+- Model documentation including:
+  - Training approach
+  - Feature description
+  - Performance metrics
+  - Limitations
+
+## 9. Security Standards
+
+### 9.1 Secure Coding Practices
+
+- Environment variables for all credentials
+- Input validation for all API endpoints
+- Parameterised database queries
+- Proper error handling without exposing internals
+- Principle of least privilege for container configurations
+
+### 9.2 Data Protection
+
+- No collection of personally identifiable information
+- Database container restricted to private subnet
+- API-only access to prediction functionality
+- Logs should not contain sensitive information
+- Docker network isolation between components
+
+## 10. Compliance and Governance
+
+### 10.1 Regulatory Compliance
+
+- No specific regulatory requirements for this educational project
+
+### 10.2 Ethical Considerations
+
+- Transparency about model limitations and accuracy
+- Clear documentation of prediction factors
+- No use of user data beyond stated purposes
+- Explicit version tracking for model reproducibility
+
+## 11. Weights & Biases Integration
+
+### 11.1 Experiment Tracking
+
+- Track all model training runs
+- Log hyperparameters and training configurations
+- Visualise learning curves and metrics
+- Compare model versions and configurations
+
+### 11.2 Model Versioning
+
+- Use W&B for model versioning and reproducibility
+- Track model artifacts and dependencies
+- Document model versions in logs and API responses
+
+## 12. Appendixes
+
+### Appendix A: Tools and Technologies
+
+- Python 3.13.3
+- PyTorch for ML components
+- FastAPI for web interface
+- PostgreSQL for database
+- psycopg for database access
+- Docker & Docker Compose for containerisation
+- Weights & Biases for experiment tracking
+- flake8 for code linting
+- GitHub for version control
+- GitHub Actions for CI/CD
+
+### Appendix B: Environment Setup
+
+- Docker-based development environment
+- PostgreSQL container for local development
+- Environment variables via .env files (not committed to repo)
+- Shared Docker network for component communication
+- Volume mounts for log persistence
+
+### Appendix C: Best Practices for Word2Vec Implementation
+
+- Token preprocessing consistency
+- Appropriate context window size (5-10 tokens)
+- Vector dimensionality (100-300 dimensions)
+- Learning rate scheduling
+- Negative sampling approach
+- Evaluation metrics for embedding quality
+</file>
+
+<file path="word2vec_pipeline/src/__init__.py">
+# Make the src directory a Python package
+</file>
+
+<file path="word2vec_pipeline/src/model.py">
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class SkipGramModel(nn.Module):
+    def __init__(self, vocab_size, embed_dim):
+        """
+        Skip-gram model with separate input and output embeddings
+
+        Args:
+            vocab_size: Size of vocabulary
+            embed_dim: Embedding dimension
+        """
+        super().__init__()
+
+        # Input (center) embeddings
+        self.in_embed = nn.Embedding(vocab_size, embed_dim)
+
+        # Output (context) embeddings
+        self.out_embed = nn.Embedding(vocab_size, embed_dim)
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize embedding weights"""
+        # Initialize embeddings to small random values
+        nn.init.uniform_(self.in_embed.weight, -0.5 /
+                         self.in_embed.embedding_dim, 0.5/self.in_embed.embedding_dim)
+        nn.init.uniform_(self.out_embed.weight, -0.5 /
+                         self.out_embed.embedding_dim, 0.5/self.out_embed.embedding_dim)
+
+    def forward(self, centers, contexts, negatives):
+        """
+        Forward pass with negative sampling loss computation
+
+        Args:
+            centers: Tensor of center word indices [batch_size]
+            contexts: Tensor of context word indices [batch_size]
+            negatives: Tensor of negative sample indices [batch_size, n_negatives]
+
+        Returns:
+            loss: Negative sampling loss
+        """
+        batch_size, n_negatives = negatives.shape
+
+        # Get embeddings for all inputs
+        # [batch_size, embed_dim]
+        center_emb = self.in_embed(centers)
+        # [batch_size, embed_dim]
+        context_emb = self.out_embed(contexts)
+        # [batch_size, n_negatives, embed_dim]
+        negative_emb = self.out_embed(negatives)
+
+        # Compute positive score (dot product of center and context vectors)
+        pos_score = torch.sum(center_emb * context_emb, dim=1)  # [batch_size]
+
+        # Calculate positive sample loss
+        pos_loss = F.logsigmoid(pos_score)                      # [batch_size]
+
+        # Calculate negative sample loss
+        # First reshape for batch matrix multiplication
+        # [batch_size, embed_dim, 1]
+        center_emb = center_emb.unsqueeze(2)
+
+        # Compute negative scores (batch matrix multiplication)
+        neg_score = torch.bmm(negative_emb, center_emb).squeeze(
+            2)  # [batch_size, n_negatives]
+
+        # Calculate negative sample loss (use negative sign for correct direction)
+        neg_loss = F.logsigmoid(-neg_score).sum(dim=1)          # [batch_size]
+
+        # Combine losses (negative sign as we're minimizing)
+        return -(pos_loss + neg_loss).mean()
+
+    def get_in_embeddings(self):
+        """Return input embeddings"""
+        return self.in_embed.weight.detach().cpu().numpy()
+
+    def get_out_embeddings(self):
+        """Return output embeddings"""
+        return self.out_embed.weight.detach().cpu().numpy()
+</file>
+
+<file path="word2vec_pipeline/src/tokenize.py">
+import re
+
+
+def tokenize(text):
+    """
+    Tokenize text by:
+    1. Converting to lowercase
+    2. Removing non-alphabetic characters
+    3. Splitting on whitespace
+
+    Args:
+        text (str): Input text to tokenize
+
+    Returns:
+        list: List of tokens
+    """
+    text = text.lower()
+    text = re.sub(r'[^a-z\s]', '', text)
+    return text.strip().split()
+
+
+def stream_tokens(path):
+    """
+    Stream tokens from a text file line by line to keep memory usage low.
+
+    Args:
+        path (str): Path to text file
+
+    Yields:
+        list: List of tokens for each line
+    """
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            yield tokenize(line)
+
+
+def load_and_tokenize_text8(text8_data):
+    """
+    Tokenize text8 data from the Hugging Face dataset
+
+    Args:
+        text8_data: Text8 dataset from Hugging Face
+
+    Returns:
+        list: List of tokens
+    """
+    text = text8_data["train"]["text"][0]
+    return tokenize(text)
+</file>
+
+<file path="word2vec_pipeline/src/utils.py">
+import os
+import numpy as np
+import torch
+import random
+import time
+
+
+def set_seed(seed=42):
+    """
+    Set random seeds for reproducibility
+
+    Args:
+        seed: Random seed value
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def get_device():
+    """
+    Get the appropriate device (CPU/GPU)
+
+    Returns:
+        torch.device: Device to use for tensor operations
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    else:
+        return torch.device("cpu")
+
+
+def save_checkpoint(model, optimizer, epoch, loss, path):
+    """
+    Save model checkpoint
+
+    Args:
+        model: PyTorch model
+        optimizer: Optimizer instance
+        epoch: Current epoch
+        loss: Current loss value
+        path: Path to save checkpoint
+    """
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    # Save checkpoint
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+    }, path)
+
+
+def load_checkpoint(model, optimizer, path):
+    """
+    Load model checkpoint
+
+    Args:
+        model: PyTorch model
+        optimizer: Optimizer instance
+        path: Path to checkpoint
+
+    Returns:
+        tuple: (model, optimizer, epoch, loss)
+    """
+    # Load checkpoint
+    checkpoint = torch.load(path)
+
+    # Load state dicts
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    return model, optimizer, checkpoint['epoch'], checkpoint['loss']
+
+
+def save_embeddings(model, path):
+    """
+    Save model embeddings to file
+
+    Args:
+        model: PyTorch model
+        path: Path to save embeddings
+    """
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    # Get embeddings
+    embeddings = model.get_in_embeddings()
+
+    # Save embeddings
+    np.save(path, embeddings)
+
+
+class Timer:
+    """Simple timer class for tracking execution time"""
+
+    def __init__(self):
+        self.start_time = None
+        self.end_time = None
+
+    def start(self):
+        """Start timer"""
+        self.start_time = time.time()
+
+    def stop(self):
+        """Stop timer"""
+        self.end_time = time.time()
+
+    def elapsed(self):
+        """Get elapsed time in seconds"""
+        if self.start_time is None:
+            return 0
+
+        end_time = self.end_time if self.end_time is not None else time.time()
+        return end_time - self.start_time
+</file>
+
+<file path="word2vec_pipeline/src/vocab.py">
+from collections import Counter
+import pickle
+import numpy as np
+
+
+class Vocabulary:
+    def __init__(self, min_freq=5):
+        self.word2idx = {}
+        self.idx2word = {}
+        self.frequencies = {}
+        self.min_freq = min_freq
+        self.sampling_table = None
+
+    def build(self, token_stream):
+        """
+        Build vocabulary from token stream
+
+        Args:
+            token_stream: Generator yielding lists of tokens
+
+        Returns:
+            self: Updated vocabulary object
+        """
+        counter = Counter()
+        print("Counting tokens...")
+        for tokens in token_stream:
+            counter.update(tokens)
+
+        print(f"Found {len(counter)} unique tokens")
+
+        # Filter by minimum frequency and create word mappings
+        filtered_words = [word for word,
+                          count in counter.items() if count >= self.min_freq]
+        print(
+            f"Keeping {len(filtered_words)} tokens with min frequency {self.min_freq}")
+
+        # Add <UNK> token at index 0
+        self.word2idx = {"<UNK>": 0}
+        self.idx2word = {0: "<UNK>"}
+
+        # Add remaining words
+        for i, word in enumerate(filtered_words):
+            self.word2idx[word] = i + 1
+            self.idx2word[i + 1] = word
+
+        # Store frequencies including <UNK>
+        self.frequencies = {
+            0: sum(count for word, count in counter.items() if count < self.min_freq)}
+        for word, idx in self.word2idx.items():
+            if word != "<UNK>":
+                self.frequencies[idx] = counter[word]
+
+        # Create subsampling probabilities
+        self.create_sampling_table()
+
+        return self
+
+    def create_sampling_table(self, t=1e-5):
+        """
+        Create subsampling table following word2vec paper:
+        P(w) = 1 - sqrt(t / f(w))
+
+        Args:
+            t: Threshold parameter (default: 1e-5)
+        """
+        total_words = float(sum(self.frequencies.values()))
+        self.sampling_table = {}
+
+        for idx, count in self.frequencies.items():
+            freq = count / total_words
+            self.sampling_table[idx] = max(0, 1 - np.sqrt(t / freq))
+
+    def get_index(self, word):
+        """Get index for word, return <UNK> index if not found"""
+        return self.word2idx.get(word, 0)
+
+    def get_word(self, idx):
+        """Get word for index"""
+        return self.idx2word.get(idx, "<UNK>")
+
+    def convert_tokens_to_ids(self, tokens):
+        """Convert a list of tokens to their corresponding indices"""
+        return [self.get_index(token) for token in tokens]
+
+    def subsample_tokens(self, token_ids):
+        """
+        Apply subsampling to tokens based on frequency
+
+        Args:
+            token_ids: List of token IDs
+
+        Returns:
+            list: Filtered list of token IDs
+        """
+        if not self.sampling_table:
+            return token_ids
+
+        return [idx for idx in token_ids if np.random.random() > self.sampling_table.get(idx, 0)]
+
+    def __len__(self):
+        """Return vocabulary size"""
+        return len(self.word2idx)
+
+    def save(self, path):
+        """Save vocabulary to file"""
+        with open(path, 'wb') as f:
+            pickle.dump(self, f)
+
+    @classmethod
+    def load(cls, path):
+        """Load vocabulary from file"""
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+</file>
+
+<file path="word2vec_pipeline/test_word_similarity.py">
+#!/usr/bin/env python
+"""
+Test word embeddings for semantic similarity
+"""
+
+from src.vocab import Vocabulary
+import os
+import pickle
+import sys
+
+import numpy as np
+
+# Add the parent directory to Python path to make src module available
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Import our vocabulary class
+
+
+def cosine_similarity(a, b):
+    """
+    Compute cosine similarity between two vectors
+    """
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
+
+
+def main():
+    # Paths
+    embeddings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "embeddings", "word_vectors.npy")
+    vocab_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "data", "processed", "vocab.pkl")
+
+    # Load embeddings
+    print(f"Loading embeddings from {embeddings_path}")
+    embeddings = np.load(embeddings_path)
+
+    # Load vocabulary
+    print(f"Loading vocabulary from {vocab_path}")
+    with open(vocab_path, "rb") as f:
+        vocab = pickle.load(f)
+
+    # Define test word pairs
+    word_pairs = [
+        ("king", "queen"),
+        ("man", "woman"),
+        ("city", "town"),
+        ("big", "large"),
+        ("small", "tiny"),
+        ("machine", "learning"),
+        ("essay", "dissertation"),
+        ("small", "tiny"),
+        ("keyboard", "mouse"),
+
+    ]
+
+    # Test similarity between word pairs
+    print("\nWord pair similarities:")
+    similarities = []
+
+    for word1, word2 in word_pairs:
+        idx1 = vocab.get_index(word1)
+        idx2 = vocab.get_index(word2)
+
+        if idx1 == 0:  # <UNK> token
+            print(f"Word '{word1}' not found in vocabulary")
+            continue
+
+        if idx2 == 0:  # <UNK> token
+            print(f"Word '{word2}' not found in vocabulary")
+            continue
+
+        vec1 = embeddings[idx1]
+        vec2 = embeddings[idx2]
+
+        similarity = cosine_similarity(vec1, vec2)
+        similarities.append(similarity)
+        print(f"Similarity between '{word1}' and '{word2}': {similarity:.4f}")
+
+    if similarities:
+        avg_similarity = np.mean(similarities)
+        print(f"\nAverage similarity: {avg_similarity:.4f}")
+
+    # Find similar words for some examples
+    test_words = ["water", "king", "computer", "day", "problem", "octopus"]
+
+    for query_word in test_words:
+        idx = vocab.get_index(query_word)
+
+        if idx == 0:  # <UNK> token
+            print(f"\nWord '{query_word}' not found in vocabulary")
+            continue
+
+        print(f"\nTop 10 words similar to '{query_word}':")
+        query_vec = embeddings[idx]
+
+        # Compute similarity to all words
+        word_similarities = []
+
+        for word, word_idx in vocab.word2idx.items():
+            if word == query_word or word == "<UNK>":
+                continue
+
+            word_vec = embeddings[word_idx]
+            similarity = cosine_similarity(query_vec, word_vec)
+            word_similarities.append((word, similarity))
+
+        # Sort by similarity and print top 10
+        word_similarities.sort(key=lambda x: x[1], reverse=True)
+
+        for word, similarity in word_similarities[:10]:
+            print(f"{word}: {similarity:.4f}")
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="word2vec_pipeline/train_config.yaml">
+# Word2Vec Training Configuration
+
+# Model parameters
+embed_dim: 100
+window_size: 5
+min_count: 5
+neg_samples: 10
+
+# Training parameters
+learning_rate: 0.002
+batch_size: 512
+epochs: 5
+
+# Paths
+checkpoint_dir: "checkpoints"
+embeddings_dir: "embeddings"
+vocab_path: "data/processed/vocab.pkl"
+
+# Random seed for reproducibility
+seed: 42
+</file>
+
+<file path="word2vec_pipeline/train_text8.py">
+#!/usr/bin/env python
+"""
+Train Word2Vec model on the text8 dataset from Hugging Face
+"""
+
+import os
+import argparse
+import yaml
+import pickle
+from datasets import load_dataset
+
+from src.tokenize import load_and_tokenize_text8, stream_tokens
+from src.vocab import Vocabulary
+from src.train import train_model
+
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description="Train Word2Vec on text8 dataset")
+    parser.add_argument("--config", type=str, default="train_config.yaml",
+                        help="Path to configuration file")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume from")
+    return parser.parse_args()
+
+
+def load_config(config_path):
+    """Load configuration from YAML file"""
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+    return config
+
+
+def save_to_file(tokens, output_path):
+    """Save tokens to a file, one sentence per line"""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        # Convert the tokens to a single line of space-separated tokens
+        f.write(" ".join(tokens))
+    print(f"Saved tokens to {output_path}")
+
+
+def prepare_text8_data():
+    """
+    Download and prepare the text8 dataset
+
+    Returns:
+        str: Path to processed tokens file
+    """
+    # Define paths
+    raw_dir = "data/raw"
+    processed_dir = "data/processed"
+    token_path = os.path.join(processed_dir, "text8_tokens.txt")
+
+    # Create directories if they don't exist
+    os.makedirs(raw_dir, exist_ok=True)
+    os.makedirs(processed_dir, exist_ok=True)
+
+    # Check if processed file already exists
+    if os.path.exists(token_path):
+        print(f"Using existing tokenized data at {token_path}")
+        return token_path
+
+    # Download and process the dataset
+    print("Downloading text8 dataset from Hugging Face...")
+    dataset = load_dataset("afmck/text8")
+
+    # Tokenize the data
+    print("Tokenizing data...")
+    tokens = load_and_tokenize_text8(dataset)
+
+    # Save tokens to file
+    save_to_file(tokens, token_path)
+
+    return token_path
+
+
+def build_or_load_vocab(token_path, vocab_path, min_freq):
+    """
+    Build vocabulary from tokens or load from file if it exists
+
+    Args:
+        token_path: Path to tokenized data
+        vocab_path: Path to save/load vocabulary
+        min_freq: Minimum word frequency
+
+    Returns:
+        Vocabulary: Vocabulary object
+    """
+    # Check if vocabulary exists
+    if os.path.exists(vocab_path):
+        print(f"Loading vocabulary from {vocab_path}")
+        with open(vocab_path, "rb") as f:
+            return pickle.load(f)
+
+    # Create vocabulary
+    print(f"Building vocabulary with min_freq={min_freq}...")
+
+    # Define a generator function for the token stream
+    def token_stream():
+        with open(token_path, "r", encoding="utf-8") as f:
+            for line in f:
+                yield line.strip().split()
+
+    vocab = Vocabulary(min_freq=min_freq)
+    vocab.build(token_stream())
+
+    # Save vocabulary
+    os.makedirs(os.path.dirname(vocab_path), exist_ok=True)
+    with open(vocab_path, "wb") as f:
+        pickle.dump(vocab, f)
+
+    print(f"Vocabulary built with {len(vocab)} words")
+    print(f"Saved vocabulary to {vocab_path}")
+
+    return vocab
+
+
+def main():
+    """Main entry point"""
+    # Parse arguments and load configuration
+    args = parse_args()
+    config = load_config(args.config)
+
+    # Prepare data
+    token_path = prepare_text8_data()
+
+    # Build or load vocabulary
+    vocab_path = config.get("vocab_path", "data/processed/vocab.pkl")
+    vocab = build_or_load_vocab(token_path, vocab_path, config["min_count"])
+
+    # Define token stream function for training
+    def get_token_stream():
+        with open(token_path, "r", encoding="utf-8") as f:
+            for line in f:
+                yield line.strip().split()
+
+    # Train model
+    train_model(
+        token_stream_fn=get_token_stream,
+        vocab=vocab,
+        embed_dim=config["embed_dim"],
+        window_size=config["window_size"],
+        neg_samples=config["neg_samples"],
+        learning_rate=config["learning_rate"],
+        batch_size=config["batch_size"],
+        epochs=config["epochs"],
+        checkpoint_dir=config["checkpoint_dir"],
+        embeddings_dir=config["embeddings_dir"],
+        resume_from=args.resume,
+        seed=config["seed"]
+    )
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path=".gitignore">
+# Python
+__pycache__/
+*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+
+# PyTorch
+*.pt
+*.pth
+*.onnx
+*.csv
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+*.ipynb
+
+# Environments
+.env
+.venv
+venv/
+ENV/
+conda-env/
+
+# Docker
+.docker/
+docker-compose.override.yml
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Database
+*.db
+*.sqlite3
+postgres-data/
+
+# Logs
+logs/
+*.log
+
+# Model files and data
+data/
+!data/.gitkeep
+!models/.gitkeep
+saved_models/
+
+# Streamlit
+secrets.toml
+
+# Temporary files
+tmp/
+.tmp/
+temp/
+
+# CI/CD
+.github/workflows/.env
+
+# Miscellaneous
+claude-conversations/
+.history/
+.aider*
+</file>
+
+<file path="ADR.md">
+# Architecture Decision Record
+
+## For Hacker News Upvote Predictor
+
+Version 0.1  
+Prepared by maxitect 
+MLX Institute  
+15 April 2025
+
+## Revision History
+
+| Name     | Date       | Reason For Changes            | Version |
+| -------- | ---------- | ----------------------------- | ------- |
+| maxitect | 15/04/2025 | Initial architecture document | 0.1     |
+
+## 1. Context and Problem Statement
+
+### 1.1 Background
+
+The Hacker News Upvote Predictor project aims to create a machine learning system that can predict the number of upvotes a post will receive on Hacker News. The system must process post titles, extract relevant features, and make accurate predictions via an API.
+
+Key drivers for this project include:
+
+- Creating a learning platform for team members new to machine learning
+- Building a functional predictive model with measurable accuracy
+- Providing a containerized solution that can be easily deployed
+- Completing the project within a tight 3-day timeframe
+
+### 1.2 Problem Definition
+
+The project presents several architectural challenges:
+
+- Implementing the Word2Vec algorithm for word embeddings
+- Creating a neural network model for upvote prediction
+- Handling various data features (titles, domains, timing)
+- Meeting the 1-second response time requirement
+- Ensuring proper logging and prediction storage
+- Building a system that can be completed by a team new to ML in just 3 days
+
+## 2. Decision Drivers
+
+### 2.1 Technical Constraints
+
+- Timeline of only 3 days for development
+- Team's limited experience with machine learning
+- 1-second response time requirement for prediction requests
+- Need for containerization and proper network isolation
+- Integration with Weights & Biases for experiment tracking
+
+### 2.2 Business Constraints
+
+- Focus on learning and practical application of ML concepts
+- System must be maintainable and understandable for educational purposes
+- Solution must be deployable on a bare metal virtual machine
+- No specific budget constraints, but emphasis on using open-source technologies
+
+## 3. Considered Alternatives
+
+### 3.1 Monolithic Architecture
+
+- **Description**: Single application containing all components (database access, model training, prediction, API)
+- **Pros**: Simplest to develop quickly; no inter-service communication overhead; easier deployment
+- **Cons**: Less modular; harder to maintain; single point of failure
+- **Fit**: Well-suited for the tight timeline and team's experience level
+
+### 3.2 Microservices Architecture
+
+- **Description**: Multiple services for data processing, model training, prediction, and API
+- **Pros**: Highly modular; independent scaling; better separation of concerns
+- **Cons**: Complex to develop and deploy; communication overhead; overkill for project scope
+- **Fit**: Poorly aligned with 3-day timeline and team experience
+
+### 3.3 Hybrid Architecture
+
+- **Description**: Two main components - training pipeline (offline) and inference service (online)
+- **Pros**: Separates training from serving; some modularity without excessive complexity
+- **Cons**: More complex than monolithic; requires clear interface design
+- **Fit**: Reasonable compromise but potentially too complex for the timeline
+
+## 4. Decision Outcome
+
+### 4.1 Chosen Alternative
+
+We will implement a monolithic architecture with clear internal module boundaries. This approach will use:
+
+- A single application with distinct logical modules
+- Pre-training for Word2Vec embeddings before API deployment
+- Clear separation between training and inference code paths
+- PyTorch for ML components with FastAPI for the web interface
+- Docker for containerization with proper network isolation
+
+This approach prioritizes rapid development while maintaining reasonable code organization. The monolithic design reduces complexity while internal module boundaries allow for future refactoring if needed.
+
+### 4.2 Positive Consequences
+
+- Faster development timeline, critical for the 3-day constraint
+- Simpler deployment and testing process
+- Reduced communication overhead improves response times
+- Easier debugging and troubleshooting for ML newcomers
+- Faster iterations on the ML pipeline during development
+
+### 4.3 Negative Consequences
+
+- Limited scaling options (whole application must scale together)
+- Potential for less clear boundaries between components
+- Possible technical debt if the system grows significantly
+- Training and inference sharing resources could impact performance
+
+## 5. Technical Architecture
+
+### 5.1 System Components
+
+The system will consist of the following logical modules within a monolithic application:
+
+1. **Data Access Module**:
+
+   - Database connection handling
+   - Data extraction and preprocessing
+   - Feature engineering pipeline
+
+2. **Word Embedding Module**:
+
+   - Text tokenization utilities
+   - Word2Vec implementation (using PyTorch)
+   - Embedding persistence and loading
+
+3. **Model Module**:
+
+   - Neural network definition
+   - Training and evaluation logic
+   - Model persistence and loading
+   - Prediction generation
+
+4. **API Module**:
+
+   - FastAPI implementation
+   - Endpoint handlers
+   - Request/response processing
+   - Input validation
+
+5. **Logging Module**:
+   - Request and prediction logging
+   - Log persistence and retrieval
+   - Performance metrics tracking
+
+### 5.2 Technical Interfaces
+
+1. **Database Interface**:
+
+   - SQLAlchemy for database access
+   - PostgreSQL connection pooling
+   - Transaction management
+
+2. **Model Interface**:
+
+   - Standard predict() method for inference
+   - Input: preprocessed features (title embeddings, domain, timing)
+   - Output: predicted upvote score
+
+3. **API Endpoints**:
+
+   - RESTful design following SPEC.md requirements
+   - JSON request/response format
+   - Proper error handling and status codes
+
+4. **W&B Integration**:
+   - Experiment tracking during training
+   - Model versioning
+   - Metric logging
+
+### 5.3 Performance Considerations
+
+1. **Embedding Precomputation**:
+
+   - Word2Vec model trained offline
+   - Embeddings cached for common tokens
+
+2. **Model Optimization**:
+
+   - Model quantization to reduce size and inference time
+   - Batch processing for title tokenization
+   - PyTorch JIT compilation for inference
+
+3. **Response Time Optimization**:
+   - In-memory caching for recent predictions
+   - Asynchronous logging to avoid blocking prediction path
+   - Database connection pooling
+
+### 5.4 Security Architecture
+
+1. **Network Isolation**:
+
+   - API container: public subnet with restricted ports
+   - Database container: private subnet
+   - Inter-container communication via Docker network
+
+2. **Input Validation**:
+   - API-level validation of all inputs
+   - Protection against injection attacks
+   - Request rate limiting
+
+## 6. Technology Stack
+
+### 6.1 Frontend Technologies
+
+- No traditional frontend (API-only service)
+- Swagger UI for API documentation and testing
+
+### 6.2 Backend Technologies
+
+- **Language**: Python 3.13.3
+- **ML Framework**: PyTorch
+- **API Framework**: FastAPI
+- **Database Access**: psycopg
+- **Database**: PostgreSQL
+- **Experiment Tracking**: Weights & Biases
+
+### 6.3 Infrastructure
+
+- **Containerisation**: Docker
+- **Deployment**: Docker Compose
+- **Environment**: Bare metal virtual machine
+- **Network**: Docker network with subnet isolation
+- **Logs**: Persistent volume mount for log storage
+
+## 7. Monitoring and Observability
+
+### 7.1 Logging Strategy
+
+- **Request Logging**:
+
+  - Structured JSON logs
+  - Storage in filesystem with rotation
+  - Includes latency, version, timestamp, input, prediction
+
+- **Application Logging**:
+
+  - Standard Python logging with levels
+  - Console output in development
+  - File output in production
+
+### 7.2 Performance Monitoring
+
+- **Latency Tracking**:
+
+  - Per-request timing measurements
+  - Periodic aggregation of statistics
+  - Stored alongside request logs
+
+- **Resource Monitoring**:
+  - Basic Docker resource monitoring
+  - CPU and memory usage tracking
+
+## 8. Future Considerations
+
+### 8.1 Potential Evolutions
+
+- **Architectural Refactoring**:
+
+  - Potential split into training and inference services
+  - Extraction of data processing as separate component
+  - Implementation of model versioning and serving
+
+- **Model Improvements**:
+  - Fine-tuning on Hacker News-specific data
+  - Exploration of more complex architectures
+  - Integration of additional features
+
+### 8.2 Technical Debt
+
+- **Monolithic Design**:
+
+  - May require refactoring as system grows
+  - Potential scaling limitations
+
+- **ML Implementation**:
+  - Initial Word2Vec implementation may be simplified
+  - Feature engineering might need refinement
+  - Hyperparameter tuning likely limited in initial version
+
+## 9. Appendixes
+
+### Appendix A: Architectural Diagrams
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                            Docker Network                                       │
+│                                                                                 │
+│  ┌─────────────────────┐    ┌────────────────────────┐   ┌───────────────────┐  │
+│  │  Database Container │    │   Model Container      │   │  API Container    │  │
+│  │  (Private Subnet)   │    │   (Private Subnet)     │   │  (Public IP)      │  │
+│  │                     │    │                        │   │                   │  │
+│  │  ┌───────────────┐  │    │  ┌────────────────┐    │   │  ┌──────────────┐ │  │
+│  │  │ PostgreSQL DB │  │    │  │ Word Embedding │    │   │  │ API Module   │ │  │
+│  │  └───────────────┘  │    │  │ Module         │    │   │  │ (FastAPI)    │ │  │
+│  │                     │    │  └────────┬───────┘    │   │  └──────┬───────┘ │  │
+│  │                     │    │           │            │   │         │         │  │
+│  │                     │    │           ▼            │   │         │         │  │
+│  │                     │    │  ┌────────────────┐    │   │         │         │  │
+│  │                     │◄─────►│ Data Access    │◄──────►│         │         │  │
+│  │                     │    │  │ Module         │    │   │         │         │  │
+│  │                     │    │  └────────┬───────┘    │   │         │         │  │
+│  │                     │    │           │            │   │         │         │  │
+│  │                     │    │           ▼            │   │         │         │  │
+│  │                     │    │  ┌────────────────┐    │   │         ▼         │  │
+│  │                     │    │  │ Model Module   │◄──────►│  ┌──────────────┐ │  │
+│  │                     │    │  └────────────────┘    │   │  │ Logging      │ │  │
+│  │                     │    │                        │   │  │ Module       │ │  │
+│  └─────────────────────┘    └────────────────────────┘   │  └──────────────┘ │  │
+│                                                          │         │         │  │
+│                                                          │         ▼         │  │
+│                                                          │  ┌──────────────┐ │  │
+│                                                          │  │ Log Storage  │ │  │
+│                                                          │  │ (Volume)     │ │  │
+│                                                          │  └──────────────┘ │  │
+│                                                          └───────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Appendix B: Technology Evaluation Details
+
+**PyTorch vs. TensorFlow**
+
+- PyTorch selected for ease of learning and flexibility
+- Better fit for team new to ML
+- More intuitive debugging
+- Simpler model definition syntax
+
+**FastAPI vs. Flask**
+
+- FastAPI selected for automatic validation and documentation
+- Better performance with async support
+- Modern typing system reduces errors
+- Built-in support for JSON serialization
+
+**Docker vs. Virtual Environment**
+
+- Docker selected for deployment consistency
+- Easier network isolation
+- Simpler deployment on target VM
+- Better resource management
+</file>
+
+<file path="environment.yml">
+# To create the conda environment, run:
+#   conda env create -f environment.yml
+name: mlx-upvote-predictor
+channels:
+  - defaults
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.13.3
+  - pytorch=2.6
+  - torchvision=0.21.0
+  - psycopg=3.2.6
+  - scikit-learn=1.6.1
+  - fastapi=0.112.2
+  - uvicorn=0.32.1
+  - pydantic-settings=2.8.1
+  - pytest=8.3.4
+  - pandas=2.2.3
+  - matplotlib=3.10.0
+  - seaborn=0.13.2
+</file>
+
+<file path="requirements.txt">
+torch==2.6
+torchvision==0.21.0
+psycopg==3.2.6
+scikit-learn==1.6.1
+fastapi==0.112.2
+uvicorn==0.32.1
+pydantic-settings==2.8.1
+pytest==8.3.4
+pandas==2.2.3
+matplotlib==3.10.0
+seaborn==0.13.2
+</file>
+
+<file path="word2vec_pipeline/src/dataset.py">
+import random
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader, IterableDataset
+
+
+def generate_skipgram_pairs(tokens, vocab, window_size=5):
+    """
+    Generate skip-gram pairs from a list of tokens
+
+    Args:
+        tokens: List of tokens
+        vocab: Vocabulary object
+        window_size: Maximum context window size
+
+    Yields:
+        tuple: (center_word_id, context_word_id) pairs
+    """
+    # Convert tokens to IDs and apply subsampling
+    token_ids = vocab.convert_tokens_to_ids(tokens)
+    token_ids = vocab.subsample_tokens(token_ids)
+
+    for i, center in enumerate(token_ids):
+        # Randomly select window size for current center word
+        window = random.randint(1, window_size)
+
+        # Generate pairs for all context words within window
+        for j in range(max(0, i - window), min(len(token_ids), i + window + 1)):
+            if i != j:  # Skip the center word itself
+                context = token_ids[j]
+                yield (center, context)
+
+
+class SkipgramDataset(IterableDataset):
+    def __init__(self, token_stream, vocab, window_size=5, neg_samples=5):
+        """
+        Dataset for Skip-gram model training
+
+        Args:
+            token_stream: Generator yielding lists of tokens
+            vocab: Vocabulary object
+            window_size: Maximum context window size
+            neg_samples: Number of negative samples per positive sample
+        """
+        self.token_stream = token_stream
+        self.vocab = vocab
+        self.window_size = window_size
+        self.neg_samples = neg_samples
+        self.vocab_size = len(vocab)
+
+        # Create negative sampling distribution (unigram^0.75)
+        self._create_negative_sampling_table()
+
+    def _create_negative_sampling_table(self, table_size=100000000):
+        """
+        Create table for negative sampling, using unigram distribution raised to power of 0.75
+        """
+        vocab_size = len(self.vocab)
+        sampling_weights = np.zeros(vocab_size)
+
+        # Get word frequencies for all words in vocabulary
+        for idx in range(vocab_size):
+            freq = self.vocab.frequencies.get(idx, 0)
+            sampling_weights[idx] = freq ** 0.75
+
+        # Normalize
+        sampling_weights = sampling_weights / np.sum(sampling_weights)
+
+        # Create sampling table
+        self.neg_sampling_table = np.random.choice(
+            np.arange(vocab_size),
+            size=table_size,
+            p=sampling_weights,
+            replace=True
+        )
+
+    def _get_negative_samples(self, positive_idx, n_samples):
+        """
+        Get negative samples from precomputed table, avoiding the positive sample
+        """
+        indices = np.random.randint(
+            0, len(self.neg_sampling_table), size=n_samples + 10)
+        samples = self.neg_sampling_table[indices]
+
+        # Filter out the positive sample
+        samples = samples[samples != positive_idx]
+
+        # If we filtered too many, get more samples
+        if len(samples) < n_samples:
+            more_samples = self._get_negative_samples(
+                positive_idx, n_samples - len(samples))
+            samples = np.concatenate([samples, more_samples])
+
+        return samples[:n_samples]
+
+    def __iter__(self):
+        """
+        Iterate through token stream and yield batches of (center, context, negatives)
+        """
+        for tokens in self.token_stream:
+            for center, context in generate_skipgram_pairs(tokens, self.vocab, self.window_size):
+                neg_samples = self._get_negative_samples(
+                    context, self.neg_samples)
+                yield center, context, neg_samples
+
+
+def create_dataloader(dataset, batch_size=512, num_workers=4):
+    """
+    Create a DataLoader for the SkipgramDataset
+
+    Args:
+        dataset: SkipgramDataset instance
+        batch_size: Batch size
+        num_workers: Number of worker processes
+
+    Returns:
+        DataLoader instance
+    """
+
+    # Create a batch collation function
+    def collate_fn(batch):
+        centers, contexts, negatives = zip(*batch)
+        return (
+            torch.LongTensor(centers),
+            torch.LongTensor(contexts),
+            torch.LongTensor(negatives)
+        )
+
+    # We need to use IterableDataset approach
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        shuffle=False,  # Cannot shuffle an IterableDataset
+    )
+</file>
+
+<file path="SPEC.md">
+# Functional Specification
+
+## For Hacker News Upvote Predictor
+
+Version 0.1  
+Prepared by maxitect  
+15 April 2025
+
+## Revision History
+
+| Name     | Date       | Reason For Changes    | Version |
+| -------- | ---------- | --------------------- | ------- |
+| maxitect | 15/04/2025 | Initial specification | 0.1     |
+
+## 1. Introduction
+
+### 1.1 Document Purpose
+
+This document provides a comprehensive overview of the functional requirements and core objectives for the Hacker News Upvote Predictor project, serving as a guide for implementation by the development team.
+
+### 1.2 Product Scope
+
+The Hacker News Upvote Predictor is a machine learning system designed to predict the number of upvotes a post on Hacker News will receive based on its title, domain, and posting time. The project aims to create an accurate prediction model while providing a learning experience for team members new to machine learning.
+
+### 1.3 Definitions, Acronyms and Abbreviations
+
+- **HN**: Hacker News
+- **ML**: Machine Learning
+- **MSE**: Mean Squared Error
+- **API**: Application Programming Interface
+- **W&B**: Weights & Biases (ML experimentation platform)
+- **Word2Vec**: Word to Vector, a technique to convert words to vector representations
+- **CBOW**: Continuous Bag of Words (a Word2Vec training method)
+- **Skip-gram**: Another Word2Vec training method
+
+### 1.4 References
+
+- [Project Brief](BRIEF.md)
+- [Data Analysis Report](REPORT.md)
+- [Hacker News Website](https://news.ycombinator.com/)
+- [Word2Vec Paper](https://arxiv.org/pdf/1301.3781.pdf)
+- [Text8 Dataset](https://huggingface.co/datasets/afmck/text8)
+
+### 1.5 Document Overview
+
+This document begins with a product overview, followed by detailed requirements covering interfaces, functionality, quality of service, compliance, and design considerations. It concludes with verification approaches and appendices containing supplementary information.
+
+## 2. Product Overview
+
+### 2.1 Product Perspective
+
+The Hacker News Upvote Predictor is a new product designed to serve as a learning platform for machine learning concepts. It operates as a standalone system with a database for data storage, a machine learning model for predictions, and an API interface for interaction.
+
+### 2.2 Product Functions
+
+The product will perform the following major functions:
+
+- Connect to a PostgreSQL database to retrieve training data
+- Process and tokenise Hacker News post titles
+- Extract features from post domains and timing information
+- Train word embeddings using Word2Vec
+- Predict upvote scores using a neural network model
+- Provide an API for making predictions and retrieving logs
+- Log prediction requests and responses
+- Store predictions in a database for future reference
+- Integrate with Weights & Biases for experiment tracking and model versioning
+
+### 2.3 Product Constraints
+
+- Development timeline of 3 days
+- Team is new to machine learning
+- System must respond to prediction requests within 1 second
+- Deployment on bare metal virtual machine server
+- Container-based architecture required
+
+### 2.4 User Characteristics
+
+The system will be used exclusively by the development team, consisting of members who are new to machine learning and seeking to learn through hands-on implementation.
+
+### 2.5 Assumptions and Dependencies
+
+- Access to the PostgreSQL database as specified in the brief
+- Availability of PyTorch libraries
+- Virtual machine environment with Docker support
+- Access to the text8 dataset for training word embeddings
+
+### 2.6 Apportioning of Requirements
+
+Must-have features:
+
+- Title processing and word embedding using Word2Vec
+- Domain-based features (domain reputation)
+- Content-based features (title length, title content)
+- Timing-based features (day of week, hour of posting)
+- API endpoints as specified in the brief
+- Prediction logging and storage
+- Containerisation with proper network isolation
+- Weights & Biases integration
+
+Should-have features:
+
+- Detailed error messages and codes
+- Simple versioning system
+
+Could-have features:
+
+- Performance optimisation to meet the 1-second response target
+
+Won't-have features:
+
+- Custom monitoring dashboards
+- Advanced model architectures
+- Author-based features (as per data analysis findings)
+
+## 3. Requirements
+
+### 3.1 External Interfaces
+
+#### 3.1.1 User Interfaces
+
+The system will not have a graphical user interface. All interaction will be through the API endpoints.
+
+#### 3.1.2 Hardware Interfaces
+
+The system will be deployed on a bare metal virtual machine server with sufficient resources to run the containers and process prediction requests.
+
+#### 3.1.3 Software Interfaces
+
+The system will interact with:
+
+- PostgreSQL database for training data and prediction storage
+- Weights & Biases platform for experiment tracking and model versioning
+- Docker for containerisation
+
+### 3.2 Functional Requirements
+
+#### 3.2.1 Data Retrieval and Preparation
+
+- The system shall connect to the PostgreSQL database using the connection string provided
+- The system shall extract and process the following features:
+  - Title text (for Word2Vec processing)
+  - Domain (extracted from URL without extension, with a special "no_domain" token for posts without URLs)
+  - Time of day (extracted from timestamp)
+  - Day of week (extracted from timestamp)
+  - Title length (character count)
+
+#### 3.2.2 Word Embedding Training
+
+- The system shall implement Word2Vec (using either CBOW or Skip-gram) to train token embeddings
+- The system shall use the text8 dataset for initial embedding training
+- The system shall tokenise text by converting to lowercase, handling punctuation, and removing extra whitespace
+
+#### 3.2.3 Prediction Model
+
+- The system shall implement a feed-forward neural network model to predict upvote scores
+- The network architecture shall consist of:
+  - An embedding layer for domains (allowing the model to learn domain importance)
+  - An input layer accepting concatenated features (word embeddings, domain embeddings, timing features, etc.)
+  - 2-3 hidden layers with ReLU activations
+  - A single output neuron with linear activation for the regression task
+- The model shall use the following inputs:
+  - Averaged word embeddings from the title
+  - Domain (using a dedicated embedding layer, including handling for posts with no domain)
+  - Time of day
+  - Day of week
+  - Title length
+- The model shall output a single value representing the predicted upvote score
+- The model shall be evaluated using Mean Squared Error (MSE)
+
+#### 3.2.4 API Endpoints
+
+The system shall implement the following API endpoints:
+
+1. `GET /ping → str`
+
+   - Returns "ok" to indicate system health
+
+2. `GET /version → {"version": str}`
+
+   - Returns the current model version using semantic versioning (e.g., "0.1.0")
+
+3. `GET /logs → {"logs": [str]}`
+
+   - Returns logged inference requests
+   - Logs must include: Latency, Version, Timestamp, Input, Prediction
+
+4. `POST /how_many_upvotes → {"author": str, "title": str, "timestamp": str} -> {"upvotes": number}`
+   - Takes post information and returns predicted upvote count
+   - Logs the request and its details
+   - Stores the prediction in the database
+
+#### 3.2.5 Logging and Storage
+
+- The system shall log all prediction requests with the following details:
+  - Latency (processing time in milliseconds)
+  - Version (model version used)
+  - Timestamp (when the request was processed)
+  - Input (complete request data)
+  - Prediction (output value)
+  - Complete post details
+- The system shall store predictions in a database for future reference
+
+#### 3.2.6 Weights & Biases Integration
+
+- The system shall integrate with Weights & Biases for:
+  - Experiment tracking during model training
+  - Logging metrics (particularly MSE)
+  - Model versioning
+  - Hyperparameter tracking
+  - Collaborative result sharing
+
+### 3.3 Quality of Service
+
+#### 3.3.1 Performance
+
+- The system shall respond to prediction requests within 1 second
+- The system shall support concurrent requests from team members
+
+#### 3.3.2 Security
+
+- The database container shall be deployed on a private subnet
+- The model container shall be deployed on a private subnet
+- The API container shall be the only component with a public IP
+- Components shall communicate via a shared Docker network
+
+#### 3.3.3 Reliability
+
+- The system shall provide specific error responses and status codes
+- The system shall validate input data before processing
+
+#### 3.3.4 Availability
+
+- The system shall be available during the development and learning period
+
+### 3.4 Compliance
+
+No specific compliance requirements have been identified for this internal learning project.
+
+### 3.5 Design and Implementation
+
+#### 3.5.1 Installation
+
+The system shall be deployed using Docker containers with the following components:
+
+- Database container (private subnet)
+- Model container (private subnet)
+- API container (public IP)
+
+#### 3.5.2 Distribution
+
+The system will be deployed locally on a bare metal virtual machine server.
+
+#### 3.5.3 Maintainability
+
+- The system shall follow a modular design for ease of understanding
+- Code shall be well-commented to facilitate learning
+- The project shall follow the structure outlined in the brief
+
+#### 3.5.4 Reusability
+
+- The Word2Vec implementation shall be designed to be reusable
+- Feature extraction components shall be modular
+
+#### 3.5.5 Portability
+
+The system shall use containerisation to ensure portability across environments.
+
+#### 3.5.6 Cost
+
+There are no specific cost constraints identified for this internal project.
+
+#### 3.5.7 Deadline
+
+The system shall be completed within 3 days of project initiation.
+
+#### 3.5.8 Proof of Concept
+
+The initial version shall serve as a proof of concept for the machine learning approach.
+
+## 4. Verification
+
+The system shall be verified through:
+
+- Unit tests for individual components
+- Integration tests for API endpoints
+- Model evaluation using a separate test dataset (15% of available data)
+- Performance testing to verify response time
+- Comparison of MSE against baseline models
+
+## 5. Appendixes
+
+### Appendix A: Glossary
+
+- **Upvote**: A positive vote given to a post on Hacker News
+- **Word2Vec**: A technique for creating word embeddings that capture semantic relationships
+- **Token**: A word or sub-word unit after text processing
+- **Embedding**: A vector representation of a token in a continuous space
+- **Regression**: A type of supervised learning where the output is a continuous value
+- **MSE**: Mean Squared Error, a metric that measures the average squared difference between predicted and actual values
+- **Docker**: A platform for developing, shipping, and running applications in containers
+- **Container**: A lightweight, standalone package that includes everything needed to run a piece of software
+- **Subnet**: A logical subdivision of an IP network
+- **API**: Application Programming Interface, a set of rules that allow programs to communicate with each other
+- **Weights & Biases**: A platform for tracking ML experiments
+
+### Appendix B: Data Analysis Summary
+
+Key findings from data analysis:
+
+**Content Factors**
+
+- Optimal title length: 25-75 characters
+- Domain quality: Technical/educational domains perform best
+- Content type: News domains slightly outperform non-news
+
+**Timing Factors**
+
+- Day of week: Weekend posts perform better
+- Time of day: Noon/early afternoon posts perform best
+- Year trends: Average scores have increased over time
+
+**Author Factors** (not used in model)
+
+- Author experience: Minimal impact on scores
+- Karma levels: Weak correlation with scores
+</file>
+
+<file path="README.md">
+# Backprop Bunch's Hacker News Upvote Predictor
+
+This repository implements a machine learning system to predict upvotes for Hacker News posts. The solution leverages a Skip-gram Word2Vec model to generate word embeddings from raw text data and combines these embeddings with other post features (such as title, domain, and timing information) to produce upvote predictions via a feed-forward neural network built with PyTorch. The API is served with FastAPI, and the project is fully containerized to ensure consistent deployment.
+
+---
+
+## Project Summary
+
+• Word2Vec Pipeline
+
+- Implements a skip-gram model for word embedding generation.
+- Includes modules for tokenization, vocabulary building (with subsampling), negative sampling, and training using PyTorch.
+
+• Upvote Prediction Model
+
+- Uses pre-trained embeddings alongside additional features (domain, title length, time features) to predict the upvote count for a Hacker News post.
+
+• API Service
+
+- Provides endpoints to check system health, retrieve model version, and submit post details for upvote prediction.
+
+• Documentation
+
+- Detailed design and architecture guidelines are provided in supporting files such as ADR.md, SPEC.md, REPORT.md, and STANDARDS.md.
+
+---
+
+## Directory Structure
+
+Word2vec Pipeline:
+
+```
+  word2vec_pipeline/
+    ├── src/ (Python modules for tokenization, vocabulary, dataset, training, and model)
+    ├── test_word_similarity.py
+    ├── train_config.yaml
+    └── train_text8.py
+```
+
+Project Root:
+
+```
+  ├── .gitignore
+  ├── ADR.md
+  ├── environment.yml
+  ├── jacks_plan.md
+  ├── README.md
+  ├── REPORT.md
+  ├── requirements.txt
+  ├── SPEC.md
+  └── STANDARDS.md
+```
+
+---
+
+## Installation
+
+1. Clone the repository and change into the project directory.
+2. Set up the environment:
+   • For Conda users:
+   - Run: conda env create -f environment.yml
+   - Activate with: conda activate mlx-upvote-predictor
+     • For Pip users:
+   - Run: pip install -r requirements.txt
+
+---
+
+## Usage
+
+Training the Word2Vec Model:
+
+- Tokenization logic is in word2vec_pipeline/src/tokenize.py; tokens are processed line by line to conserve memory.
+- The vocabulary is built in word2vec_pipeline/src/vocab.py, including token filtering and subsampling probabilities.
+- To train the embeddings, run the script:
+  python word2vec_pipeline/train_text8.py --config train_config.yaml
+- Checkpoints are saved as specified in the configuration. Use word2vec_pipeline/test_word_similarity.py to evaluate embedding quality.
+
+Running the Upvote Prediction API:
+
+- The API has endpoints for health checks (/ping), model version information (/version), and prediction requests (/how_many_upvotes).
+- To launch the API service, use a command similar to:
+  uvicorn main:app --host 0.0.0.0 --port 8000
+- Ensure the API entrypoint aligns with the specifications outlined in SPEC.md.
+
+---
+
+## Documentation & Additional Resources
+
+• Architectural Decisions: See ADR.md  
+• Project Standards: See STANDARDS.md  
+• Data Analysis Report: See REPORT.md  
+• Project Plan: See jacks_plan.md  
+• Functional Specification: See SPEC.md
+
+---
+
+## Contributing
+
+Contributions and improvements are encouraged. Please open an issue or submit a pull request with clear explanations and adhere to the established coding standards.
+
+---
+
+## License
+
+Include your license information (e.g., MIT License) here or state the terms under which the project is made available.
+
+---
+
+## Contact
+
+For additional questions or clarifications, contact the project maintainers.
+</file>
+
+<file path="word2vec_pipeline/src/train.py">
+import os
+
+import numpy as np
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
+
+from .dataset import SkipgramDataset, create_dataloader
+from .model import SkipGramModel
+from .utils import (Timer, get_device, save_checkpoint, save_embeddings,
+                    set_seed)
+
+
+def train_epoch(model, dataloader, optimizer, device):
+    """
+    Train model for one epoch
+
+    Args:
+        model: SkipGramModel instance
+        dataloader: DataLoader for training data
+        optimizer: Optimizer instance
+        device: Device to use for tensor operations
+
+    Returns:
+        float: Average loss for this epoch
+    """
+    model.train()
+    total_loss = 0
+    total_batches = 0
+
+    # Create timer for progress tracking
+    timer = Timer()
+    timer.start()
+
+    for i, (centers, contexts, negatives) in enumerate(dataloader):
+        # Move data to device
+        centers = centers.to(device)
+        contexts = contexts.to(device)
+        negatives = negatives.to(device)
+
+        # Zero gradients
+        optimizer.zero_grad()
+
+        # Forward pass
+        loss = model(centers, contexts, negatives)
+
+        # Backward pass and update
+        loss.backward()
+        optimizer.step()
+
+        # Track progress
+        total_loss += loss.item()
+        total_batches += 1
+
+        if (i + 1) % 100 == 0:
+            elapsed = timer.elapsed()
+            print(f"Batch {i+1}, Loss: {loss.item():.4f}, "
+                  f"Speed: {100 / elapsed:.1f} batches/s")
+            timer.start()
+
+    # Return average loss
+    return total_loss / total_batches
+
+
+def train_model(
+    token_stream_fn,
+    vocab,
+    embed_dim=100,
+    window_size=5,
+    neg_samples=10,
+    learning_rate=0.002,
+    batch_size=512,
+    epochs=5,
+    checkpoint_dir="checkpoints",
+    embeddings_dir="embeddings",
+    resume_from=None,
+    seed=42
+):
+    """
+    Train SkipGram Word2Vec model
+
+    Args:
+        token_stream_fn: Function that returns token stream generator
+        vocab: Vocabulary instance
+        embed_dim: Embedding dimension
+        window_size: Context window size
+        neg_samples: Number of negative samples per context word
+        learning_rate: Learning rate
+        batch_size: Batch size
+        epochs: Number of epochs
+        checkpoint_dir: Directory to save checkpoints
+        embeddings_dir: Directory to save embeddings
+        resume_from: Path to checkpoint to resume from
+        seed: Random seed
+
+    Returns:
+        SkipGramModel: Trained model
+    """
+    # Set seeds for reproducibility
+    set_seed(seed)
+
+    # Get device
+    device = get_device()
+    print(f"Using device: {device}")
+
+    # Initialize model
+    vocab_size = len(vocab)
+    model = SkipGramModel(vocab_size, embed_dim)
+    model.to(device)
+
+    # Initialize optimizer
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    if resume_from is not None:
+        print(f"Resuming from checkpoint: {resume_from}")
+        model, optimizer, start_epoch, _ = load_checkpoint(
+            model, optimizer, resume_from)
+
+    # Training loop
+    print(f"Starting training for {epochs} epochs")
+    best_loss = float('inf')
+
+    for epoch in range(start_epoch, epochs):
+        # Create a new dataset and dataloader for each epoch
+        dataset = SkipgramDataset(
+            token_stream_fn(),
+            vocab,
+            window_size=window_size,
+            neg_samples=neg_samples
+        )
+
+        dataloader = create_dataloader(
+            dataset,
+            batch_size=batch_size,
+            num_workers=0  # Use 0 to avoid multiprocessing issues with generators
+        )
+
+        # Train for one epoch
+        print(f"Epoch {epoch+1}/{epochs}")
+        epoch_timer = Timer()
+        epoch_timer.start()
+
+        epoch_loss = train_epoch(model, dataloader, optimizer, device)
+
+        # Report progress
+        elapsed = epoch_timer.elapsed()
+        print(
+            f"Epoch {epoch+1} completed in {elapsed:.2f}s, Loss: {epoch_loss:.4f}")
+
+        # Save checkpoint
+        checkpoint_path = os.path.join(
+            checkpoint_dir, f"pretrain_epoch_{epoch+1}.pt")
+        save_checkpoint(model, optimizer, epoch+1, epoch_loss, checkpoint_path)
+        print(f"Checkpoint saved to {checkpoint_path}")
+
+        # Save embeddings if best loss
+        if epoch_loss < best_loss:
+            best_loss = epoch_loss
+            embeddings_path = os.path.join(embeddings_dir, "word_vectors.npy")
+            save_embeddings(model, embeddings_path)
+            print(f"Best embeddings saved to {embeddings_path}")
+
+    # Save final embeddings
+    final_embeddings_path = os.path.join(
+        embeddings_dir, "word_vectors_final.npy")
+    save_embeddings(model, final_embeddings_path)
+    print(f"Final embeddings saved to {final_embeddings_path}")
+
+    return model
+</file>
+
+</files>
