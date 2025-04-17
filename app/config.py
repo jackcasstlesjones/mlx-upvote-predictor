@@ -1,8 +1,10 @@
 import os
 from dotenv import load_dotenv
 
+
 def load_env():
     load_dotenv()
+
 
 default_config = {
     "DB_HOST": "localhost",
@@ -11,6 +13,7 @@ default_config = {
     "DB_PASSWORD": "password",
     "DB_NAME": "dbname"
 }
+
 
 def get_config():
     config = default_config.copy()
