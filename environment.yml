@@ -20,3 +20,4 @@ dependencies:
   - seaborn=0.13.2
   - wandb==0.19.8
   - python-dotenv=1.1.0
+  - datasets=3.3.2
