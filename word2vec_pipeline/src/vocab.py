@@ -1,19 +1,38 @@
 from collections import Counter
 import pickle
+import os
+from typing import Dict, Generator, List, Optional
 import numpy as np
 
 
 class Vocabulary:
-    def __init__(self, min_freq=5):
-        self.word2idx = {}
-        self.idx2word = {}
-        self.frequencies = {}
-        self.min_freq = min_freq
-        self.sampling_table = None
+    """
+    Vocabulary class for word2vec model.
 
-    def build(self, token_stream):
+    Handles token-to-index mapping, frequency counting, and subsampling
+    for efficient training. Includes methods to save/load vocabulary
+    and convert between tokens and indices.
+    """
+
+    def __init__(self, min_freq: int = 5):
         """
-        Build vocabulary from token stream
+        Initialize vocabulary object.
+
+        Args:
+            min_freq: Minimum frequency threshold for words to be included
+        """
+        self.word2idx: Dict[str, int] = {}
+        self.idx2word: Dict[int, str] = {}
+        self.frequencies: Dict[int, int] = {}
+        self.min_freq: int = min_freq
+        self.sampling_table: Optional[Dict[int, float]] = None
+
+    def build(
+        self,
+        token_stream: Generator[List[str], None, None]
+    ) -> 'Vocabulary':
+        """
+        Build vocabulary from token stream.
 
         Args:
             token_stream: Generator yielding lists of tokens
@@ -60,7 +79,7 @@ class Vocabulary:
 
         return self
 
-    def create_sampling_table(self, t=1e-5):
+    def create_sampling_table(self, t: float = 1e-5) -> None:
         """
         Create subsampling table following word2vec paper:
         P(w) = 1 - sqrt(t / f(w))
@@ -75,27 +94,54 @@ class Vocabulary:
             freq = count / total_words
             self.sampling_table[idx] = max(0, 1 - np.sqrt(t / freq))
 
-    def get_index(self, word):
-        """Get index for word, return <UNK> index if not found"""
+    def get_index(self, word: str) -> int:
+        """
+        Get index for word, return <UNK> index if not found.
+
+        Args:
+            word: Input word
+
+        Returns:
+            int: Index of word or 0 for unknown words
+        """
         return self.word2idx.get(word, 0)
 
-    def get_word(self, idx):
-        """Get word for index"""
+    def get_word(self, idx: int) -> str:
+        """
+        Get word for index.
+
+        Args:
+            idx: Word index
+
+        Returns:
+            str: Word at given index or '<UNK>' if not found
+        """
         return self.idx2word.get(idx, "<UNK>")
 
-    def convert_tokens_to_ids(self, tokens):
-        """Convert a list of tokens to their corresponding indices"""
+    def convert_tokens_to_ids(self, tokens: List[str]) -> List[int]:
+        """
+        Convert a list of tokens to their corresponding indices.
+
+        Args:
+            tokens: List of token strings
+
+        Returns:
+            List[int]: List of token indices
+        """
         return [self.get_index(token) for token in tokens]
 
-    def subsample_tokens(self, token_ids):
+    def subsample_tokens(self, token_ids: List[int]) -> List[int]:
         """
-        Apply subsampling to tokens based on frequency
+        Apply subsampling to tokens based on frequency.
+
+        Implements the subsampling technique from the word2vec paper
+        which helps balance the influence of common words.
 
         Args:
             token_ids: List of token IDs
 
         Returns:
-            list: Filtered list of token IDs
+            List[int]: Filtered list of token IDs
         """
         if not self.sampling_table:
             return token_ids
@@ -105,17 +151,36 @@ class Vocabulary:
             if np.random.random() > self.sampling_table.get(idx, 0)
         ]
 
-    def __len__(self):
-        """Return vocabulary size"""
+    def __len__(self) -> int:
+        """
+        Return vocabulary size.
+
+        Returns:
+            int: Number of tokens in vocabulary
+        """
         return len(self.word2idx)
 
-    def save(self, path):
-        """Save vocabulary to file"""
+    def save(self, path: str) -> None:
+        """
+        Save vocabulary to file.
+
+        Args:
+            path: File path for saving the vocabulary
+        """
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'wb') as f:
             pickle.dump(self, f)
 
     @classmethod
-    def load(cls, path):
-        """Load vocabulary from file"""
+    def load(cls, path: str) -> 'Vocabulary':
+        """
+        Load vocabulary from file.
+
+        Args:
+            path: File path to load vocabulary from
+
+        Returns:
+            Vocabulary: Loaded vocabulary object
+        """
         with open(path, 'rb') as f:
             return pickle.load(f)
