@@ -8,6 +8,7 @@ import argparse
 from pathlib import Path
 import psycopg
 import datetime
+import time
 
 from upvote_regressor import UpvoteRegressor 
 from title_embedder import TitleEmbedder
@@ -123,10 +124,18 @@ def train_model(train_loader, val_loader, embed_dim, hidden_dims=[128, 64],
         model.train()
         train_loss = 0.0
         
-        for batch in train_loader:
+        batch_times = []
+        samples_processed = 0
+        epoch_start_time = time.time()
+        train_start_time = time.time()
+        
+        for batch_idx, batch in enumerate(train_loader):
+            batch_start_time = time.time()
+            
             # Get data
             embeddings = batch['embedding'].to(device)
             scores = batch['score'].to(device)
+            batch_size = embeddings.size(0)
             
             # Forward pass
             outputs = model(embeddings)
@@ -137,15 +146,36 @@ def train_model(train_loader, val_loader, embed_dim, hidden_dims=[128, 64],
             loss.backward()
             optimizer.step()
             
-            train_loss += loss.item() * embeddings.size(0)
+            # Track metrics
+            batch_time = time.time() - batch_start_time
+            batch_times.append(batch_time)
+            train_loss += loss.item() * batch_size
+            samples_processed += batch_size
+            
+            # Print batch progress (every 10 batches)
+            if (batch_idx + 1) % 10 == 0 or batch_idx == 0:
+                avg_batch_time = sum(batch_times[-10:]) / min(10, len(batch_times))
+                samples_per_sec = batch_size / avg_batch_time
+                elapsed = time.time() - train_start_time
+                progress = (batch_idx + 1) / len(train_loader) * 100
+                
+                print(f"Epoch {epoch+1}/{epochs} - Batch {batch_idx+1}/{len(train_loader)} ({progress:.1f}%) - "
+                      f"Loss: {loss.item():.4f} - "
+                      f"Batch time: {batch_time:.3f}s - "
+                      f"Samples/sec: {samples_per_sec:.1f} - "
+                      f"Elapsed: {elapsed:.1f}s")
         
-        # Calculate average training loss
+        # Calculate average training loss and timing stats
         train_loss /= len(train_loader.dataset)
         history['train_loss'].append(train_loss)
+        train_time = time.time() - train_start_time
+        avg_batch_time = sum(batch_times) / len(batch_times)
+        avg_samples_per_sec = samples_processed / train_time
         
         # Validation phase
         model.eval()
         val_loss = 0.0
+        val_start_time = time.time()
         
         with torch.no_grad():
             for batch in val_loader:
@@ -162,12 +192,16 @@ def train_model(train_loader, val_loader, embed_dim, hidden_dims=[128, 64],
         # Calculate average validation loss
         val_loss /= len(val_loader.dataset)
         history['val_loss'].append(val_loss)
+        val_time = time.time() - val_start_time
+        epoch_time = time.time() - epoch_start_time
         
         # Update learning rate
         scheduler.step(val_loss)
         
         # Print progress
-        print(f'Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.4f} - Val Loss: {val_loss:.4f}')
+        print(f'Epoch {epoch+1}/{epochs} completed in {epoch_time:.2f}s')
+        print(f'  Train: {train_time:.2f}s - {len(train_loader)} batches - {avg_samples_per_sec:.1f} samples/sec - Loss: {train_loss:.4f}')
+        print(f'  Val: {val_time:.2f}s - Loss: {val_loss:.4f}')
         
         # Save best model
         if val_loss < best_val_loss:
@@ -175,7 +209,7 @@ def train_model(train_loader, val_loader, embed_dim, hidden_dims=[128, 64],
             # Create model directory if it doesn't exist
             os.makedirs('models', exist_ok=True)
             torch.save(model.state_dict(), 'models/upvote_regressor_best.pt')
-            print(f"Saved best model with validation loss: {val_loss:.4f}")
+            print(f"  Saved best model with validation loss: {val_loss:.4f}")
     
     # Save final model
     torch.save(model.state_dict(), 'models/upvote_regressor_final.pt')
